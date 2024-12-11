@@ -48,7 +48,7 @@ class DQN(nn.Module):
     
 
 
-class AgentSP:
+class AgentMPG:
     def __init__(self, num_features, num_actions, dropout_rate, hidden_layers):
         self.num_features = num_features
         self.num_actions = num_actions
