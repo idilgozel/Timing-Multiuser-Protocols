@@ -23,6 +23,7 @@ class Agent:
             this_all_states = this_all_states.cpu().numpy()
 
             this_all_states_filename = os.path.join(states_dir, f"{n}_nodes.npy")
+            os.makedirs(states_dir, exist_ok=True)
             np.save(this_all_states_filename, this_all_states)
         else:
             this_all_states = np.load(os.path.join(states_dir, f"{n}_nodes.npy"))
@@ -34,6 +35,7 @@ class Agent:
             this_all_actions = this_all_actions.cpu().numpy()
 
             this_all_actions_filename = os.path.join(actions_dir, f"{n}_nodes.npy")
+            os.makedirs(actions_dir, exist_ok=True)
             np.save(this_all_actions_filename, this_all_actions)
         else:
             this_all_actions = np.load(os.path.join(actions_dir, f"{n}_nodes.npy"))
@@ -64,5 +66,4 @@ class Agent:
             self.q_table[state_idx, action_idx] = self.q_table[state_idx, action_idx] + self.alpha * (reward + self.q_table[state_idx, action_idx])
         else:
             self.q_table[state_idx, action_idx] = self.q_table[state_idx, action_idx] + self.alpha * (reward + self.gamma * self.q_table[new_state_idx][0].max() - self.q_table[state_idx, action_idx])
-
 

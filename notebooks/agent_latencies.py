@@ -31,7 +31,8 @@ for j, vertices in enumerate(nodes):
     data = np.array([ent_count, swap_count, fusion_count]).mean(axis = 1)
     data_std = np.array([ent_count, swap_count, fusion_count]).std(axis = 1)
 
-    qamel_results[0, j] = np.sum(data)
+qamel_results[0, j] = np.sum(data)
     qamel_results[1, j] = np.sum(data_std)
 
+os.makedirs("qamel/outputs/results", exist_ok=True)
 np.savetxt(f"qamel/outputs/results/qamel_results_for_different_nodes.txt", qamel_results)
