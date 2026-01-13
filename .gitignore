@@ -164,6 +164,7 @@ cython_debug/
 #.idea/
 
 *.txt
+!requirements.txt
 *.npy
 *.pth
 plotting.py
@@ -171,3 +172,4 @@ wandb/
 hyperparameter_sweep.py
 plot_results.py
 daquiri/
+qamel/outputs/
