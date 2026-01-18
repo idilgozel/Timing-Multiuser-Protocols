@@ -115,6 +115,36 @@ def reward_shape(chain_state, terminated, truncated):
     else:
         return -1
 
+def is_action_valid_given_state(state0, action_matrix):
+    n = state0.size(0)
+    degrees = torch.count_nonzero(state0, dim=1)
+
+    new_edges = (action_matrix > 0) & (state0 == 0)
+    upper = torch.triu(torch.ones_like(state0), diagonal=1).bool()
+    new_edges = new_edges & upper
+
+    add = torch.zeros(n, device=state0.device, dtype=degrees.dtype)
+    idx = new_edges.nonzero(as_tuple=False)
+    if idx.numel() > 0:
+        add.index_add_(0, idx[:, 0], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+        add.index_add_(0, idx[:, 1], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+
+    new_degrees = degrees + add
+    limits = torch.full((n,), 2, device=state0.device, dtype=degrees.dtype)
+    limits[0] = 1
+    limits[-1] = 1
+
+    swap_nodes = torch.diagonal(action_matrix, 0)
+    if swap_nodes.numel() > 2:
+        swap_nodes = swap_nodes[1:-1]
+    swap_idx = (swap_nodes > 0).nonzero(as_tuple=True)[0]
+    if swap_idx.numel() > 0:
+        swap_degrees = new_degrees[swap_idx + 1]
+        if not torch.all(swap_degrees == 2):
+            return False
+
+    return torch.all(new_degrees <= limits).item()
+
 
 def get_operation_count(states):
     ent_count = []; swap_count = []
