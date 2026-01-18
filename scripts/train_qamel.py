@@ -6,7 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from qamel.agent import Agent
 from qamel.environment import RepeaterChain
-from qamel.utils import check_if_bad_state, check_if_final_state, reward_shape
+from qamel.utils import check_if_bad_state, check_if_final_state, reward_shape, is_action_valid_given_state
 
 import numpy as np
 import torch
@@ -100,6 +100,43 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+def _get_valid_action_indices(state0, all_actions):
+    valid_indices = []
+    for idx in range(all_actions.size(0)):
+        if is_action_valid_given_state(state0, all_actions[idx]):
+            valid_indices.append(idx)
+    return valid_indices
+
+def _action_has_swap(action_matrix):
+    diag = torch.diagonal(action_matrix, 0)
+    if diag.numel() > 2:
+        diag = diag[1:-1]
+    return bool((diag > 0).any().item())
+
+def _count_swap_ready_nodes(state0, action_matrix):
+    n = state0.size(0)
+    degrees = torch.count_nonzero(state0, dim=1)
+
+    new_edges = (action_matrix > 0) & (state0 == 0)
+    upper = torch.triu(torch.ones_like(state0), diagonal=1).bool()
+    new_edges = new_edges & upper
+
+    add = torch.zeros(n, device=state0.device, dtype=degrees.dtype)
+    idx = new_edges.nonzero(as_tuple=False)
+    if idx.numel() > 0:
+        add.index_add_(0, idx[:, 0], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+        add.index_add_(0, idx[:, 1], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+
+    new_degrees = degrees + add
+    swap_nodes = torch.diagonal(action_matrix, 0)
+    if swap_nodes.numel() > 2:
+        swap_nodes = swap_nodes[1:-1]
+    swap_idx = (swap_nodes > 0).nonzero(as_tuple=True)[0]
+    if swap_idx.numel() == 0:
+        return 0
+
+    return int(torch.sum(new_degrees[swap_idx + 1] == 2).item())
+
 def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     n = env_vars["n"]
     pgen = env_vars["pgen"]
@@ -109,6 +146,7 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     max_actions = kwargs["max_actions"]
     torch_device = kwargs["torch_device"]
     obs_mode = kwargs["obs_mode"]
+    swap_ready_bonus = kwargs["swap_ready_bonus"]
 
     this_RepeaterChain = RepeaterChain(n, pgen, pswap, torch_device)
 
@@ -123,7 +161,10 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
         np.save(actions_path, all_actions.cpu().numpy())
 
     num_actions = all_actions.size(0)
-    input_shape = (3, n, n)
+    no_op_candidates = (all_actions.view(num_actions, -1).sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+    no_op_idx = int(no_op_candidates[0].item()) if len(no_op_candidates) > 0 else None
+    input_channels = 4 if obs_mode == "counter_exposed_plus_ready" else 3
+    input_shape = (input_channels, n, n)
 
     policy_net = DQNNet(input_shape, num_actions).to(torch_device)
     target_net = DQNNet(input_shape, num_actions).to(torch_device)
@@ -131,6 +172,12 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     target_net.eval()
 
     optimizer = optim.Adam(policy_net.parameters(), lr=hyperparameter_configs.lr)
+    resume_checkpoint = kwargs.get("resume_checkpoint")
+    if resume_checkpoint is not None:
+        policy_net.load_state_dict(resume_checkpoint["model_state"])
+        if "optimizer_state" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        target_net.load_state_dict(policy_net.state_dict())
     replay_buffer = ReplayBuffer(hyperparameter_configs.buffer_size)
 
     cumulative_reward_per_episode = np.zeros(training_episodes)
@@ -151,18 +198,28 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
             )
 
             obs = preprocess_obs(current_state, obs_mode, hyperparameter_configs.counter_norm).to(torch_device)
-            if random.random() < epsilon:
-                action_idx = random.randrange(num_actions)
+            valid_indices = _get_valid_action_indices(current_state[0], all_actions)
+            if len(valid_indices) == 0:
+                action_idx = no_op_idx if no_op_idx is not None else random.randrange(num_actions)
+            elif random.random() < epsilon:
+                action_idx = random.choice(valid_indices)
             else:
                 with torch.no_grad():
-                    q_values = policy_net(obs.unsqueeze(0))
-                    action_idx = int(torch.argmax(q_values, dim=1).item())
+                    q_values = policy_net(obs.unsqueeze(0)).squeeze(0)
+                    valid_mask = torch.zeros(num_actions, dtype=torch.bool, device=q_values.device)
+                    valid_mask[valid_indices] = True
+                    q_values[~valid_mask] = -1e9
+                    action_idx = int(torch.argmax(q_values).item())
 
             new_state = this_RepeaterChain.step(current_state, all_actions[action_idx])
 
             bad_state = check_if_bad_state(new_state)
             final_state = check_if_final_state(new_state)
             reward = reward_shape(new_state, final_state, bad_state)
+            # Reward contextually correct swap timing (post-generation readiness).
+            ready_nodes = _count_swap_ready_nodes(current_state[0], all_actions[action_idx])
+            if ready_nodes > 0:
+                reward += swap_ready_bonus * ready_nodes
 
             next_obs = preprocess_obs(new_state, obs_mode, hyperparameter_configs.counter_norm).to(torch_device)
             replay_buffer.add(obs.cpu(), action_idx, reward, next_obs.cpu(), bad_state or final_state)
@@ -199,7 +256,7 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                 done = True
                 cumulative_reward_per_episode[episode] = cumulative_reward
 
-    return policy_net, cumulative_reward_per_episode
+    return policy_net, optimizer, cumulative_reward_per_episode
         
 max_actions = 100
 training_episodes = 10000
@@ -216,6 +273,10 @@ if __name__ == "__main__":
     parser.add_argument("--pgen", type = float)
     parser.add_argument("--pswap", type = float)
     parser.add_argument("--model_tag", type=str, default="baseline")
+    parser.add_argument("--obs_mode", type=str, choices=["baseline", "counter_exposed", "counter_exposed_plus_ready"], default=None)
+    parser.add_argument("--train_episodes", type=int, default=None)
+    parser.add_argument("--force_train", action="store_true")
+    parser.add_argument("--swap_ready_bonus", type=float, default=0.5)
 
     env_vars_class = parser.parse_args()
     env_vars = env_vars_class.__dict__
@@ -223,42 +284,56 @@ if __name__ == "__main__":
     this_hyperparameters = hyperparameters
     this_dqn_hyperparameters = dqn_hyperparameters
 
-    if env_vars["model_tag"] == "counter_exposed":
+    if env_vars_class.obs_mode is not None:
+        agent_mode = env_vars_class.obs_mode
+    else:
+        agent_mode = "baseline" if env_vars["model_tag"] == "baseline" else "counter_exposed"
+    print(f"Training mode: {agent_mode}")
+    if agent_mode == "counter_exposed":
+        train_episodes = env_vars_class.train_episodes or training_episodes
         model_path = (
             f"qamel/outputs/models/dqn_n{env_vars['n']}_pgen{env_vars['pgen']}_pswap{env_vars['pswap']}_{env_vars['model_tag']}.pt"
         )
-        if os.path.exists(model_path):
-            print(f"A DQN agent for {env_vars['n']} nodes has been trained.")
-        else:
-            start_time = time.time()
-            model, training_rewards = train_dqn_agent(
-                env_vars,
-                this_dqn_hyperparameters,
-                max_actions=max_actions,
-                training_episodes=training_episodes,
-                torch_device=torch_device,
-                obs_mode="counter_exposed",
-            )
+        resume_checkpoint = None
+        if os.path.exists(model_path) and not env_vars_class.force_train:
+            resume_checkpoint = torch.load(model_path, map_location=torch_device)
+            print(f"Loaded DQN checkpoint from {model_path}, continuing training.")
 
-            os.makedirs("qamel/outputs/models", exist_ok=True)
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "input_shape": (3, env_vars["n"], env_vars["n"]),
-                    "counter_norm": this_dqn_hyperparameters.counter_norm,
-                },
-                model_path,
-            )
+        start_time = time.time()
+        model, model_optimizer, training_rewards = train_dqn_agent(
+            env_vars,
+            this_dqn_hyperparameters,
+            max_actions=max_actions,
+            training_episodes=train_episodes,
+            torch_device=torch_device,
+            obs_mode=agent_mode,
+            resume_checkpoint=resume_checkpoint,
+            swap_ready_bonus=env_vars_class.swap_ready_bonus,
+        )
 
-            end_time = time.time()
-            print(f"Took {end_time - start_time} seconds to train.")
+        os.makedirs("qamel/outputs/models", exist_ok=True)
+        input_channels = 4 if agent_mode == "counter_exposed_plus_ready" else 3
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": model_optimizer.state_dict(),
+                "input_shape": (input_channels, env_vars["n"], env_vars["n"]),
+                "counter_norm": this_dqn_hyperparameters.counter_norm,
+                "obs_mode": agent_mode,
+            },
+            model_path,
+        )
+
+        end_time = time.time()
+        print(f"Took {end_time - start_time} seconds to train.")
 
     else:
+        train_episodes = env_vars_class.train_episodes or training_episodes
         if os.path.exists(f"qamel/q_table_storage/{env_vars['n']}_nodes.txt"):
             print(f"An agent for {env_vars['n']} nodes has been trained.")
         else:
             start_time = time.time()
-            q_table, training_rewards = train_q_agent(env_vars, this_hyperparameters, max_actions = max_actions, training_episodes = training_episodes, torch_device = torch_device)
+            q_table, training_rewards = train_q_agent(env_vars, this_hyperparameters, max_actions = max_actions, training_episodes = train_episodes, torch_device = torch_device)
 
             os.makedirs("qamel/q_table_storage", exist_ok=True)
             np.savetxt(f"qamel/q_table_storage/{env_vars['n']}_nodes.txt", q_table.cpu().numpy())
