@@ -147,6 +147,9 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     torch_device = kwargs["torch_device"]
     obs_mode = kwargs["obs_mode"]
     swap_ready_bonus = kwargs["swap_ready_bonus"]
+    use_curriculum = kwargs["use_curriculum"]
+    curriculum_steps = kwargs["curriculum_steps"]
+    curriculum_boundaries = kwargs["curriculum_boundaries"]
 
     this_RepeaterChain = RepeaterChain(n, pgen, pswap, torch_device)
 
@@ -183,7 +186,25 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     cumulative_reward_per_episode = np.zeros(training_episodes)
     steps_done = 0
 
+    current_limit = max_actions
+    phase = None
     for episode in track(range(training_episodes), description="Training DQN agent..."):
+        if use_curriculum:
+            if episode < curriculum_boundaries[0]:
+                current_limit = curriculum_steps[0]
+                if phase != 0:
+                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
+                    phase = 0
+            elif episode < curriculum_boundaries[1]:
+                current_limit = curriculum_steps[1]
+                if phase != 1:
+                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
+                    phase = 1
+            else:
+                current_limit = curriculum_steps[2]
+                if phase != 2:
+                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
+                    phase = 2
         cumulative_reward = 0
         step = 0
         done = False
@@ -252,7 +273,7 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
             if steps_done % hyperparameter_configs.target_update_steps == 0:
                 target_net.load_state_dict(policy_net.state_dict())
 
-            if (step >= max_actions or final_state or bad_state):
+            if (step >= current_limit or final_state or bad_state):
                 done = True
                 cumulative_reward_per_episode[episode] = cumulative_reward
 
@@ -277,6 +298,9 @@ if __name__ == "__main__":
     parser.add_argument("--train_episodes", type=int, default=None)
     parser.add_argument("--force_train", action="store_true")
     parser.add_argument("--swap_ready_bonus", type=float, default=0.5)
+    parser.add_argument("--use_curriculum", action="store_true")
+    parser.add_argument("--curriculum_steps", type=str, default="20,40,100")
+    parser.add_argument("--curriculum_boundaries", type=str, default="5000,10000")
 
     env_vars_class = parser.parse_args()
     env_vars = env_vars_class.__dict__
@@ -300,6 +324,9 @@ if __name__ == "__main__":
             print(f"Loaded DQN checkpoint from {model_path}, continuing training.")
 
         start_time = time.time()
+        curriculum_steps = [int(x) for x in env_vars_class.curriculum_steps.split(",")]
+        curriculum_boundaries = [int(x) for x in env_vars_class.curriculum_boundaries.split(",")]
+
         model, model_optimizer, training_rewards = train_dqn_agent(
             env_vars,
             this_dqn_hyperparameters,
@@ -309,6 +336,9 @@ if __name__ == "__main__":
             obs_mode=agent_mode,
             resume_checkpoint=resume_checkpoint,
             swap_ready_bonus=env_vars_class.swap_ready_bonus,
+            use_curriculum=env_vars_class.use_curriculum,
+            curriculum_steps=curriculum_steps,
+            curriculum_boundaries=curriculum_boundaries,
         )
 
         os.makedirs("qamel/outputs/models", exist_ok=True)
@@ -320,6 +350,9 @@ if __name__ == "__main__":
                 "input_shape": (input_channels, env_vars["n"], env_vars["n"]),
                 "counter_norm": this_dqn_hyperparameters.counter_norm,
                 "obs_mode": agent_mode,
+                "use_curriculum": env_vars_class.use_curriculum,
+                "curriculum_steps": curriculum_steps,
+                "curriculum_boundaries": curriculum_boundaries,
             },
             model_path,
         )
