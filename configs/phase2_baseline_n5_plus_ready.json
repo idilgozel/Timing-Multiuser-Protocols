@@ -1,0 +1,32 @@
+{
+  "name": "phase2_baseline_n5_plus_ready",
+  "description": "Canonical Phase 2 DQN benchmark for the current 1D repeater-chain executable scope.",
+  "train": {
+    "model_tag": "phase2_baseline_n5",
+    "n": 5,
+    "pgen": 0.4,
+    "pswap": 0.7,
+    "obs_mode": "counter_exposed_plus_ready",
+    "seed": 12345,
+    "reward_mode": "base",
+    "swap_ready_bonus": 0.5,
+    "train_episodes": 10000,
+    "max_actions": 100,
+    "checkpoint_every": 1000,
+    "log_every": 100,
+    "use_curriculum": false
+  },
+  "evaluate": {
+    "model_tag": "phase2_baseline_n5",
+    "n": 5,
+    "pgen": 0.4,
+    "pswap": 0.7,
+    "obs_mode": "counter_exposed_plus_ready",
+    "seed": 12345,
+    "reward_mode": "base",
+    "swap_ready_bonus": 0.5,
+    "eval_episodes": 500,
+    "max_actions": 100,
+    "eval_epsilon": 0.0
+  }
+}

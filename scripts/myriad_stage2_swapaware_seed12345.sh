@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+export RUN_TAG="${RUN_TAG:-swapaware_seed12345}"
+export SEED="${SEED:-12345}"
+export N="${N:-5}"
+export PGEN="${PGEN:-0.4}"
+export PSWAP="${PSWAP:-0.7}"
+export OBS_MODE="${OBS_MODE:-counter_exposed_plus_ready}"
+export REWARD_MODE="${REWARD_MODE:-base}"
+export EVAL_EPISODES="${EVAL_EPISODES:-500}"
+export MAX_ACTIONS="${MAX_ACTIONS:-100}"
+export EVAL_EPSILON="${EVAL_EPSILON:-0.0}"
+export BUDGETS="${BUDGETS:-200 500 1000}"
+export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
+export LOG_EVERY="${LOG_EVERY:-50}"
+export BEST_EVAL_EVERY="${BEST_EVAL_EVERY:-50}"
+export BEST_EVAL_EPISODES="${BEST_EVAL_EPISODES:-50}"
+export BEST_EVAL_MAX_ACTIONS="${BEST_EVAL_MAX_ACTIONS:-100}"
+export BEST_EVAL_SEED="${BEST_EVAL_SEED:-12345}"
+export PREFER_SWAP_WHEN_READY_TRAIN="${PREFER_SWAP_WHEN_READY_TRAIN:-1}"
+export STUDY_ROOT="${STUDY_ROOT:-qamel/outputs/studies}"
+export STUDY_FORCE_TRAIN="${STUDY_FORCE_TRAIN:-0}"
+export ALLOW_ARCHIVE_OVERWRITE="${ALLOW_ARCHIVE_OVERWRITE:-0}"
+
+cd "${REPO_ROOT}"
+bash "${SCRIPT_DIR}/run_stage2_study.sh"
