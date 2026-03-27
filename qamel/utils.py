@@ -108,12 +108,69 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def reward_shape(chain_state, terminated, truncated):
     if terminated:
-        return 1000/torch.amax(chain_state).item()
+        return 100.0
     elif truncated:
-        return -100
-    
+        return -100.0
     else:
-        return -1
+        return -1.0
+
+def count_swap_ready_nodes(state0, action_matrix):
+    n = state0.size(0)
+    degrees = torch.count_nonzero(state0, dim=1)
+
+    new_edges = (action_matrix > 0) & (state0 == 0)
+    upper = torch.triu(torch.ones_like(state0), diagonal=1).bool()
+    new_edges = new_edges & upper
+
+    add = torch.zeros(n, device=state0.device, dtype=degrees.dtype)
+    idx = new_edges.nonzero(as_tuple=False)
+    if idx.numel() > 0:
+        add.index_add_(0, idx[:, 0], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+        add.index_add_(0, idx[:, 1], torch.ones(idx.size(0), device=state0.device, dtype=degrees.dtype))
+
+    new_degrees = degrees + add
+    swap_nodes = torch.diagonal(action_matrix, 0)
+    if swap_nodes.numel() > 2:
+        swap_nodes = swap_nodes[1:-1]
+    swap_idx = (swap_nodes > 0).nonzero(as_tuple=True)[0]
+    if swap_idx.numel() == 0:
+        return 0
+
+    return int(torch.sum(new_degrees[swap_idx + 1] == 2).item())
+
+def compute_reward(
+    chain_state,
+    terminated,
+    truncated,
+    reward_mode="base",
+    swap_ready_bonus=0.0,
+    prev_state0=None,
+    action_matrix=None,
+):
+    if reward_mode != "base":
+        raise ValueError(
+            f"Unsupported reward_mode='{reward_mode}'. Supported reward modes: ['base']"
+        )
+    return reward_shape(chain_state, terminated, truncated)
+
+def get_episode_status(state, steps, max_actions):
+    """Return normalized episode flags after a transition.
+
+    A state only counts as final/successful if it reaches the end-to-end link
+    without simultaneously violating the degree constraints.
+    """
+    bad_state = check_if_bad_state(state)
+    final_state = check_if_final_state(state) and not bad_state
+    terminated = final_state or bad_state
+    truncated = (steps >= max_actions) and not terminated
+    done = terminated or truncated
+    return {
+        "final_state": final_state,
+        "bad_state": bad_state,
+        "terminated": terminated,
+        "truncated": truncated,
+        "done": done,
+    }
 
 def is_action_valid_given_state(state0, action_matrix):
     n = state0.size(0)
