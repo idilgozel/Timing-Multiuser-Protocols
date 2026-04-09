@@ -126,7 +126,11 @@ class ReplayBuffer:
     def load_state_dict(self, state_dict):
         capacity = state_dict.get("capacity", self.buffer.maxlen)
         items = state_dict.get("items", [])
-        self.buffer = deque(items, maxlen=capacity)
+        cpu_items = [
+            tuple(x.cpu() if isinstance(x, torch.Tensor) else x for x in item)
+            for item in items
+        ]
+        self.buffer = deque(cpu_items, maxlen=capacity)
 
 def _as_serializable_hparams(hyperparameter_configs):
     return {
@@ -254,13 +258,21 @@ def _restore_rng_state(checkpoint, torch_device):
     if "numpy_random_state" in checkpoint:
         np.random.set_state(checkpoint["numpy_random_state"])
     if "torch_random_state" in checkpoint:
-        torch.random.set_rng_state(checkpoint["torch_random_state"])
+        rng_state = checkpoint["torch_random_state"]
+        if not isinstance(rng_state, torch.ByteTensor):
+            rng_state = rng_state.cpu().byte()
+        torch.random.set_rng_state(rng_state)
     if (
         torch_device.type == "cuda"
         and torch.cuda.is_available()
         and "torch_cuda_random_state_all" in checkpoint
     ):
-        torch.cuda.set_rng_state_all(checkpoint["torch_cuda_random_state_all"])
+        cuda_rng_states = checkpoint["torch_cuda_random_state_all"]
+        cuda_rng_states = [
+            s.cpu().byte() if not isinstance(s, torch.ByteTensor) else s
+            for s in cuda_rng_states
+        ]
+        torch.cuda.set_rng_state_all(cuda_rng_states)
 
 def _build_dqn_checkpoint_payload(
     *,
