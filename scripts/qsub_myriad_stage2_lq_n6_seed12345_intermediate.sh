@@ -1,6 +1,6 @@
 #!/bin/bash -l
-#$ -N qnet_lq_n6_progressive
-#$ -l h_rt=48:00:00
+#$ -N qnet_lq_n6_intermediate
+#$ -l h_rt=8:00:00
 #$ -l mem=8G
 #$ -l gpu=1
 #$ -wd /home/ucapgoz/Timing-Multiuser-Protocols
@@ -27,4 +27,4 @@ if torch.cuda.is_available():
     print("device_name", torch.cuda.get_device_name(0))
 PY
 
-bash scripts/myriad_stage2_lq_n6_seed12345_progressive.sh
+bash scripts/myriad_stage2_lq_n6_seed12345_intermediate.sh
