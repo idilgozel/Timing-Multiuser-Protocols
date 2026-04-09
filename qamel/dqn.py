@@ -19,13 +19,15 @@ class DQNNet(nn.Module):
     def __init__(self, input_shape, num_actions):
         super().__init__()
         channels, height, width = input_shape
+        input_size = channels * height * width
+        hidden_size = max(512, ((input_size * 4 + 255) // 256) * 256)
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(channels * height * width, 512),
+            nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(512, 512),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(512, num_actions),
+            nn.Linear(hidden_size, num_actions),
         )
 
     def forward(self, x):
