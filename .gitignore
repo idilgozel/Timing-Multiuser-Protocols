@@ -173,3 +173,4 @@ hyperparameter_sweep.py
 plot_results.py
 daquiri/
 qamel/outputs/
+.claude/
