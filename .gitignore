@@ -174,3 +174,6 @@ plot_results.py
 daquiri/
 qamel/outputs/
 .claude/
+
+# Local generated codebase overview/report.
+CODEBASE_OVERVIEW.*
