@@ -16,7 +16,7 @@ import csv
 import json
 import random
 
-from qamel.dqn import DQNNet, preprocess_obs
+from qamel.dqn import DQNNet, build_dqn_net, preprocess_obs
 
 SUPPORTED_OBS_MODES = {"baseline", "counter_exposed", "counter_exposed_plus_ready"}
 DQN_OBS_MODES = {"counter_exposed", "counter_exposed_plus_ready"}
@@ -219,7 +219,9 @@ def evaluate_q_table(env_vars, **kwargs):
                 f"Checkpoint obs_mode='{checkpoint_obs_mode}' does not match requested obs_mode='{obs_mode}'."
             )
         num_actions = all_actions.size(0)
-        policy_net = DQNNet(input_shape, num_actions).to(torch_device)
+        # Legacy checkpoints carry no net_arch -> default "dqn" -> DQNNet (identical behaviour).
+        net_arch = checkpoint.get("net_arch", "dqn")
+        policy_net = build_dqn_net(input_shape, num_actions, net_arch).to(torch_device)
         try:
             policy_net.load_state_dict(checkpoint["model_state"])
         except RuntimeError as exc:

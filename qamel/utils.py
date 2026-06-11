@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from itertools import product
 
@@ -113,6 +114,65 @@ def reward_shape(chain_state, terminated, truncated):
         return -100.0
     else:
         return -1.0
+
+def chain_progress_potential(state: np.ndarray, n: int) -> int:
+    """
+    Potential function Phi(s) for PBRS on a repeater chain.
+
+    Returns the length of the longest contiguous run of present
+    elementary links starting at node 0 in the adjacency channel s[0].
+
+    Concretely: the largest k such that s[0][i, i+1] == 1
+    for all i in 0..k-1. If s[0][0,1] == 0 then Phi = 0.
+    Range: 0 .. n-1.
+
+    This is a valid potential (bounded, depends only on s, not on a)
+    and therefore PBRS with F = gamma * Phi(s') - Phi(s) preserves
+    the optimal policy.
+    """
+    for i in range(n - 1):
+        if state[0][i, i + 1] != 1:
+            return i
+    return max(0, n - 1)
+
+def chain_progress_potential_batch(states: torch.Tensor) -> torch.Tensor:
+    """Return Phi(s) for batched states shaped (batch, 3, n, n)."""
+    if states.dim() != 4:
+        raise ValueError(f"states must have shape (batch, 3, n, n), got {tuple(states.shape)}")
+    if states.size(1) < 1 or states.size(2) != states.size(3):
+        raise ValueError(f"states must have shape (batch, 3, n, n), got {tuple(states.shape)}")
+
+    batch_size = states.size(0)
+    n = states.size(2)
+    if n <= 1:
+        return torch.zeros(batch_size, dtype=torch.long, device=states.device)
+
+    idx = torch.arange(n - 1, device=states.device)
+    elementary_links = states[:, 0, idx, idx + 1].eq(1)
+    return elementary_links.to(torch.long).cumprod(dim=1).sum(dim=1)
+
+def test_chain_progress_potential():
+    n = 5
+    expected = [0, 1, 2, 3, 4]
+    states = []
+
+    for phi in expected:
+        state = np.zeros((3, n, n), dtype=np.float32)
+        for i in range(phi):
+            state[0, i, i + 1] = 1
+            state[0, i + 1, i] = 1
+        if phi + 1 < n - 1:
+            state[0, n - 2, n - 1] = 1
+            state[0, n - 1, n - 2] = 1
+        states.append(state)
+
+    for state, phi in zip(states, expected):
+        assert chain_progress_potential(state, n) == phi
+
+    torch_states = torch.from_numpy(np.stack(states, axis=0))
+    actual = chain_progress_potential_batch(torch_states)
+    expected_tensor = torch.tensor(expected, dtype=torch.long)
+    assert torch.equal(actual, expected_tensor), (actual, expected_tensor)
 
 def count_swap_ready_nodes(state0, action_matrix):
     n = state0.size(0)

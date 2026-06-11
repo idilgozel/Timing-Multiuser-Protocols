@@ -21,7 +21,8 @@ import torch.optim as optim
 from rich.progress import track
 
 from qamel.utils import generate_all_valid_actions, linear_schedule
-from qamel.dqn import DQNNet, preprocess_obs
+from qamel.dqn import DQNNet, build_dqn_net, preprocess_obs
+from qamel.utils import chain_progress_potential_batch
 
 def train_q_agent(env_vars, hyperparameter_configs, **kwargs):
 
@@ -106,13 +107,15 @@ class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
 
-    def add(self, obs, action, reward, next_obs, done):
-        self.buffer.append((obs, action, reward, next_obs, done))
+    def add(self, obs, action, reward, next_obs, terminated, truncated):
+        # Store terminated and truncated separately: only terminated masks the
+        # bootstrap in the Bellman target; truncated transitions still bootstrap.
+        self.buffer.append((obs, action, reward, next_obs, terminated, truncated))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        obs, actions, rewards, next_obs, dones = zip(*batch)
-        return obs, actions, rewards, next_obs, dones
+        obs, actions, rewards, next_obs, terminated, truncated = zip(*batch)
+        return obs, actions, rewards, next_obs, terminated, truncated
 
     def __len__(self):
         return len(self.buffer)
@@ -126,10 +129,14 @@ class ReplayBuffer:
     def load_state_dict(self, state_dict):
         capacity = state_dict.get("capacity", self.buffer.maxlen)
         items = state_dict.get("items", [])
-        cpu_items = [
-            tuple(x.cpu() if isinstance(x, torch.Tensor) else x for x in item)
-            for item in items
-        ]
+        cpu_items = []
+        for item in items:
+            cpu_item = tuple(x.cpu() if isinstance(x, torch.Tensor) else x for x in item)
+            # Migrate legacy 5-tuples (obs, a, r, next_obs, done): treat the old
+            # done flag as terminated and truncated=False so loading never crashes.
+            if len(cpu_item) == 5:
+                cpu_item = (*cpu_item[:4], cpu_item[4], False)
+            cpu_items.append(cpu_item)
         self.buffer = deque(cpu_items, maxlen=capacity)
 
 def _as_serializable_hparams(hyperparameter_configs):
@@ -302,6 +309,10 @@ def _build_dqn_checkpoint_payload(
     episode_successes,
     episode_avg_losses,
     episode_ready_means,
+    net_arch="dqn",
+    double_dqn=False,
+    pbrs=False,
+    pbrs_scale=1.0,
     best_eval_metrics=None,
 ):
     payload = {
@@ -317,6 +328,10 @@ def _build_dqn_checkpoint_payload(
         "training_episodes": training_episodes,
         "use_curriculum": use_curriculum,
         "prefer_swap_when_ready_train": prefer_swap_when_ready_train,
+        "net_arch": net_arch,
+        "double_dqn": double_dqn,
+        "pbrs": pbrs,
+        "pbrs_scale": pbrs_scale,
         "curriculum_steps": curriculum_steps,
         "curriculum_boundaries": curriculum_boundaries,
         "seed": seed,
@@ -379,6 +394,7 @@ def _validate_resume_checkpoint(
     swap_ready_bonus,
     prefer_swap_when_ready_train,
     seed,
+    net_arch,
 ):
     if checkpoint is None:
         return
@@ -391,6 +407,7 @@ def _validate_resume_checkpoint(
         "swap_ready_bonus": swap_ready_bonus,
         "prefer_swap_when_ready_train": prefer_swap_when_ready_train,
         "seed": seed,
+        "net_arch": net_arch,
     }
     for key, expected_value in expected.items():
         if expected_value is None:
@@ -425,11 +442,22 @@ def _is_better_eval_metrics(candidate, current_best):
         return True
     return False
 
+# Cache of valid-action indices keyed by the binary occupancy pattern of state0.
+# is_action_valid_given_state reads state0 only through (state0 == 0) / count_nonzero,
+# so the cache returns bit-identical results -- it is a pure speedup, not a behaviour
+# change. all_actions is fixed within a process, so it is not part of the key.
+_VALID_INDEX_CACHE = {}
+
 def _get_valid_action_indices(state0, all_actions):
+    key = tuple((state0 != 0).detach().flatten().to(torch.uint8).cpu().tolist())
+    cached = _VALID_INDEX_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
     valid_indices = []
     for idx in range(all_actions.size(0)):
         if is_action_valid_given_state(state0, all_actions[idx]):
             valid_indices.append(idx)
+    _VALID_INDEX_CACHE[key] = tuple(valid_indices)
     return valid_indices
 
 def _filter_training_action_indices(
@@ -584,6 +612,11 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     best_eval_metrics_path = kwargs["best_eval_metrics_path"]
     best_eval_checkpoint_path = kwargs["best_eval_checkpoint_path"]
     prefer_swap_when_ready_train = kwargs["prefer_swap_when_ready_train"]
+    dueling = kwargs.get("dueling", False)
+    double_dqn = kwargs.get("double_dqn", False)
+    pbrs = kwargs.get("pbrs", False)
+    pbrs_scale = kwargs.get("pbrs_scale", 1.0)
+    net_arch = "dueling" if dueling else "dqn"
 
     this_RepeaterChain = RepeaterChain(n, pgen, pswap, torch_device)
 
@@ -603,8 +636,8 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     input_channels = 4 if obs_mode == "counter_exposed_plus_ready" else 3
     input_shape = (input_channels, n, n)
 
-    policy_net = DQNNet(input_shape, num_actions).to(torch_device)
-    target_net = DQNNet(input_shape, num_actions).to(torch_device)
+    policy_net = build_dqn_net(input_shape, num_actions, net_arch).to(torch_device)
+    target_net = build_dqn_net(input_shape, num_actions, net_arch).to(torch_device)
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
 
@@ -750,31 +783,58 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                 action_matrix=all_actions[action_idx],
             )
 
+            # Potential-based reward shaping (Change 4). Shaping affects only the
+            # replay target (r_train); episode-return logging stays unshaped (r_env)
+            # so success rates and mean returns remain comparable across runs.
+            r_train = reward
+            if pbrs:
+                phi_s = chain_progress_potential_batch(current_state.unsqueeze(0))[0].item()
+                phi_s_next = chain_progress_potential_batch(new_state.unsqueeze(0))[0].item()
+                shaping = hyperparameter_configs.gamma * phi_s_next - phi_s
+                r_train = reward + pbrs_scale * shaping
+
             next_obs = preprocess_obs(new_state, obs_mode, hyperparameter_configs.counter_norm).to(torch_device)
-            replay_buffer.add(obs.cpu(), action_idx, reward, next_obs.cpu(), episode_status["done"])
+            replay_buffer.add(
+                obs.cpu(),
+                action_idx,
+                r_train,
+                next_obs.cpu(),
+                episode_status["terminated"],
+                episode_status["truncated"],
+            )
 
             current_state = new_state
             cumulative_reward += reward
 
             if len(replay_buffer) >= hyperparameter_configs.batch_size:
-                obs_batch, actions_batch, rewards_batch, next_obs_batch, dones_batch = replay_buffer.sample(
+                obs_batch, actions_batch, rewards_batch, next_obs_batch, terminated_batch, truncated_batch = replay_buffer.sample(
                     hyperparameter_configs.batch_size
                 )
                 obs_batch = torch.stack(obs_batch).to(torch_device)
                 actions_batch = torch.tensor(actions_batch, dtype=torch.long, device=torch_device).unsqueeze(1)
                 rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32, device=torch_device).unsqueeze(1)
                 next_obs_batch = torch.stack(next_obs_batch).to(torch_device)
-                dones_batch = torch.tensor(dones_batch, dtype=torch.float32, device=torch_device).unsqueeze(1)
+                # Only `terminated` (success / bad state) masks the bootstrap; `truncated`
+                # (hit max_actions) still bootstraps from V(s') -- the episode could continue.
+                terminated_batch = torch.tensor(terminated_batch, dtype=torch.float32, device=torch_device).unsqueeze(1)
 
                 current_q = policy_net(obs_batch).gather(1, actions_batch)
                 with torch.no_grad():
-                    next_q_values = target_net(next_obs_batch)
                     # Channel 0 remains the adjacency matrix for both DQN observation modes.
                     next_state0_batch = next_obs_batch[:, 0]
                     next_valid_mask = _build_valid_action_mask(next_state0_batch, all_actions, no_op_idx)
-                    masked_next_q_values = next_q_values.masked_fill(~next_valid_mask, -1e9)
-                    raw_next_q = next_q_values.max(1, keepdim=True)[0]
-                    next_q = masked_next_q_values.max(1, keepdim=True)[0]
+                    next_q_target_values = target_net(next_obs_batch)
+                    if double_dqn:
+                        # Double-DQN: policy net selects the (valid) argmax action,
+                        # target net evaluates it.
+                        next_q_policy = policy_net(next_obs_batch).masked_fill(~next_valid_mask, -1e9)
+                        a_star = next_q_policy.argmax(dim=1, keepdim=True)
+                        next_q = next_q_target_values.gather(1, a_star)
+                        raw_next_q = next_q_target_values.max(1, keepdim=True)[0]
+                    else:
+                        masked_next_q_values = next_q_target_values.masked_fill(~next_valid_mask, -1e9)
+                        raw_next_q = next_q_target_values.max(1, keepdim=True)[0]
+                        next_q = masked_next_q_values.max(1, keepdim=True)[0]
                     if debug_target_mask and not target_mask_debug_printed:
                         sample_valid = int(next_valid_mask[0].sum().item())
                         print(
@@ -784,7 +844,7 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                             f"valid_actions={sample_valid}",
                         )
                         target_mask_debug_printed = True
-                    target_q = rewards_batch + (1.0 - dones_batch) * hyperparameter_configs.gamma * next_q
+                    target_q = rewards_batch + (1.0 - terminated_batch) * hyperparameter_configs.gamma * next_q
 
                 loss = nn.SmoothL1Loss()(current_q, target_q)
                 optimizer.zero_grad()
@@ -863,6 +923,10 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                 replay_buffer=replay_buffer,
                 hyperparameter_configs=hyperparameter_configs,
                 input_shape=input_shape,
+                net_arch=net_arch,
+                double_dqn=double_dqn,
+                pbrs=pbrs,
+                pbrs_scale=pbrs_scale,
                 completed_episode_idx=episode,
                 global_step=steps_done,
                 torch_device=torch_device,
@@ -1019,6 +1083,12 @@ if __name__ == "__main__":
     parser.add_argument("--best_eval_max_actions", type=int, default=100)
     parser.add_argument("--best_eval_seed", type=int, default=None)
     parser.add_argument("--prefer_swap_when_ready_train", action="store_true")
+    parser.add_argument("--double-dqn", dest="double_dqn", action="store_true", default=False)
+    parser.add_argument("--dueling", action="store_true", default=False)
+    parser.add_argument("--pbrs", action="store_true", default=False)
+    parser.add_argument("--pbrs-scale", dest="pbrs_scale", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--use_curriculum", action="store_true")
     parser.add_argument("--curriculum_steps", type=str, default="20,40,100")
@@ -1032,6 +1102,11 @@ if __name__ == "__main__":
     this_dqn_hyperparameters = dqn_hyperparameters
     if env_vars_class.eps_decay_steps is not None:
         this_dqn_hyperparameters.eps_decay_steps = env_vars_class.eps_decay_steps
+    if env_vars_class.lr is not None:
+        this_dqn_hyperparameters.lr = env_vars_class.lr
+    if env_vars_class.batch_size is not None:
+        this_dqn_hyperparameters.batch_size = env_vars_class.batch_size
+    net_arch = "dueling" if env_vars_class.dueling else "dqn"
 
     agent_mode = _resolve_obs_mode(env_vars_class.obs_mode, env_vars["model_tag"])
     print(f"Training mode: {agent_mode}")
@@ -1083,6 +1158,12 @@ if __name__ == "__main__":
                 "best_eval_max_actions": env_vars_class.best_eval_max_actions,
                 "best_eval_seed": env_vars_class.best_eval_seed,
                 "prefer_swap_when_ready_train": env_vars_class.prefer_swap_when_ready_train,
+                "net_arch": net_arch,
+                "double_dqn": env_vars_class.double_dqn,
+                "pbrs": env_vars_class.pbrs,
+                "pbrs_scale": env_vars_class.pbrs_scale,
+                "lr": this_dqn_hyperparameters.lr,
+                "batch_size": this_dqn_hyperparameters.batch_size,
                 "use_curriculum": env_vars_class.use_curriculum,
                 "curriculum_steps": env_vars_class.curriculum_steps,
                 "curriculum_boundaries": env_vars_class.curriculum_boundaries,
@@ -1114,6 +1195,7 @@ if __name__ == "__main__":
                 swap_ready_bonus=env_vars_class.swap_ready_bonus,
                 prefer_swap_when_ready_train=env_vars_class.prefer_swap_when_ready_train,
                 seed=env_vars_class.seed,
+                net_arch=net_arch,
             )
             if resume_checkpoint is not None:
                 resume_message = f"Loaded DQN checkpoint from {resume_path}"
@@ -1156,6 +1238,10 @@ if __name__ == "__main__":
             best_eval_metrics_path=run_artifacts["best_eval_metrics_path"],
             best_eval_checkpoint_path=run_artifacts["best_eval_checkpoint_path"],
             prefer_swap_when_ready_train=env_vars_class.prefer_swap_when_ready_train,
+            dueling=env_vars_class.dueling,
+            double_dqn=env_vars_class.double_dqn,
+            pbrs=env_vars_class.pbrs,
+            pbrs_scale=env_vars_class.pbrs_scale,
             train_log_path=train_log_path,
             metrics_path=metrics_path,
             swap_ready_bonus=env_vars_class.swap_ready_bonus,
@@ -1188,6 +1274,10 @@ if __name__ == "__main__":
             replay_buffer=replay_buffer,
             hyperparameter_configs=this_dqn_hyperparameters,
             input_shape=(input_channels, env_vars["n"], env_vars["n"]),
+            net_arch=net_arch,
+            double_dqn=env_vars_class.double_dqn,
+            pbrs=env_vars_class.pbrs,
+            pbrs_scale=env_vars_class.pbrs_scale,
             completed_episode_idx=max(0, completed_episodes - 1),
             global_step=steps_done,
             torch_device=torch_device,
