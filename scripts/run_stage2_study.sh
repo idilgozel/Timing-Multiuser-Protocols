@@ -29,6 +29,12 @@ USE_CURRICULUM="${USE_CURRICULUM:-0}"
 TRAIN_DEBUG_FLAG="${TRAIN_DEBUG_FLAG:-}"
 EVAL_DEBUG_FLAG="${EVAL_DEBUG_FLAG:-}"
 EVAL_DIAG_FLAG="${EVAL_DIAG_FLAG:-}"
+DUELING="${DUELING:-0}"
+DOUBLE_DQN="${DOUBLE_DQN:-0}"
+PBRS="${PBRS:-0}"
+PBRS_SCALE="${PBRS_SCALE:-1.0}"
+LR="${LR:-}"
+BATCH_SIZE="${BATCH_SIZE:-}"
 STUDY_ROOT="${STUDY_ROOT:-qamel/outputs/studies}"
 ALLOW_ARCHIVE_OVERWRITE="${ALLOW_ARCHIVE_OVERWRITE:-0}"
 STUDY_FORCE_TRAIN="${STUDY_FORCE_TRAIN:-0}"
@@ -132,6 +138,21 @@ for BUDGET in ${BUDGETS}; do
   fi
   if [[ "${USE_CURRICULUM}" == "1" ]]; then
     TRAIN_ARGS+=(--use_curriculum)
+  fi
+  if [[ "${DUELING}" == "1" ]]; then
+    TRAIN_ARGS+=(--dueling)
+  fi
+  if [[ "${DOUBLE_DQN}" == "1" ]]; then
+    TRAIN_ARGS+=(--double-dqn)
+  fi
+  if [[ "${PBRS}" == "1" ]]; then
+    TRAIN_ARGS+=(--pbrs --pbrs-scale "${PBRS_SCALE}")
+  fi
+  if [[ -n "${LR}" ]]; then
+    TRAIN_ARGS+=(--lr "${LR}")
+  fi
+  if [[ -n "${BATCH_SIZE}" ]]; then
+    TRAIN_ARGS+=(--batch_size "${BATCH_SIZE}")
   fi
   if [[ -n "${TRAIN_DEBUG_FLAG}" ]]; then
     TRAIN_ARGS+=("${TRAIN_DEBUG_FLAG}")
