@@ -38,6 +38,18 @@ def _set_global_seed(seed: int, torch_device: torch.device) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+_EPISODE_SEED_PRIME = 1_000_003  # large prime: spreads (S, i) pairs without collisions in range
+
+
+def _episode_seed(seed: int, episode_index: int) -> int:
+    """Deterministic per-episode env seed derived from (top-level seed S, episode index i).
+
+    Implements Common Random Numbers: episode i is reseeded to the SAME value for every
+    policy, so all policies face the identical environment RNG stream for that episode.
+    """
+    return (seed * _EPISODE_SEED_PRIME + episode_index) % (2**31 - 1)
+
+
 def _resolve_run_dir(run_name: str) -> str:
     if os.path.isdir(run_name):
         return run_name
@@ -183,6 +195,7 @@ def _select_action(
 def _evaluate_policy(
     policy: str,
     *,
+    seed: int,
     n: int,
     pgen: float,
     pswap: float,
@@ -195,14 +208,24 @@ def _evaluate_policy(
     max_actions: int,
     eval_epsilon: float,
     torch_device: torch.device,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     env = RepeaterChain(n, pgen, pswap, torch_device)
     successes = 0
     truncations = 0
     success_steps: list[int] = []
     returns: list[float] = []
+    episode_rows: list[dict[str, Any]] = []
 
-    for _ in range(episodes):
+    for episode_index in range(episodes):
+        # Per-episode Common Random Numbers: reseed the GLOBAL torch generator from
+        # (seed, episode_index) before each episode. RepeaterChain.step() draws its
+        # pgen/pswap Bernoullis exclusively via torch.rand(1) on this global generator
+        # (environment.py L33, L50), so this makes episode `episode_index` present the
+        # identical env RNG stream to every policy -> any outcome difference is due to the
+        # policy's actions alone, satisfying METRIC.md's "same index = same instance".
+        torch.manual_seed(_episode_seed(seed, episode_index))
+        if torch_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_episode_seed(seed, episode_index))
         current_state = env.reset()
         cumulative_reward = 0.0
         steps = 0
@@ -245,14 +268,23 @@ def _evaluate_policy(
             done = episode_status["done"]
 
         assert episode_status is not None
+        success_flag = bool(episode_status["final_state"])  # final-and-not-bad (see get_episode_status)
         returns.append(float(cumulative_reward))
-        if episode_status["final_state"]:
+        if success_flag:
             successes += 1
             success_steps.append(steps)
         if episode_status["truncated"]:
             truncations += 1
+        episode_rows.append({
+            "seed": seed,
+            "policy": policy,
+            "episode_index": episode_index,
+            "success": success_flag,
+            "steps": int(steps),
+            "return": float(cumulative_reward),
+        })
 
-    return {
+    metrics = {
         "policy": policy,
         "success_rate": successes / episodes,
         "mean_steps": float(np.mean(success_steps)) if success_steps else None,
@@ -260,6 +292,7 @@ def _evaluate_policy(
         "truncated_fraction": truncations / episodes,
         "n_success": successes,
     }
+    return metrics, episode_rows
 
 
 def _stats(values: list[float | None]) -> dict[str, float | None]:
@@ -291,6 +324,115 @@ def _summary_for_policy(rows: list[dict[str, Any]]) -> dict[str, float | None]:
 
 def _fmt(value: float | None, spec: str = ".4f") -> str:
     return "n/a" if value is None else format(value, spec)
+
+
+def _compute_gate2(
+    episode_rows: list[dict[str, Any]],
+    seeds: list[int],
+    gate1_delta: float = 0.02,
+) -> dict[str, Any]:
+    """Pre-registered Gate-2 (METRIC.md): paired, shared-solved steps comparison.
+
+    Per seed, restrict to episodes solved by BOTH dqn_greedy (filter OFF) and heuristic
+    (matched by episode_index = same instance under per-episode CRN), then
+    Delta = mean_steps_heuristic - mean_steps_dqn_greedy. Seeds are the unit of analysis.
+    """
+    per_seed = []
+    deltas: list[float] = []
+    gate1_pass_count = 0
+    for seed in seeds:
+        dqn = {r["episode_index"]: r for r in episode_rows if r["seed"] == seed and r["policy"] == "dqn_greedy"}
+        heur = {r["episode_index"]: r for r in episode_rows if r["seed"] == seed and r["policy"] == "heuristic"}
+        n_eps = max(len(dqn), len(heur))
+        sr_dqn = sum(1 for r in dqn.values() if r["success"]) / len(dqn) if dqn else None
+        sr_heur = sum(1 for r in heur.values() if r["success"]) / len(heur) if heur else None
+        gate1 = bool(sr_dqn is not None and sr_heur is not None and sr_dqn >= sr_heur - gate1_delta)
+        gate1_pass_count += int(gate1)
+        shared = [i for i in dqn if i in heur and dqn[i]["success"] and heur[i]["success"]]
+        if shared:
+            ms_dqn = float(np.mean([dqn[i]["steps"] for i in shared]))
+            ms_heur = float(np.mean([heur[i]["steps"] for i in shared]))
+            delta = ms_heur - ms_dqn
+        else:
+            ms_dqn = ms_heur = delta = None
+        if delta is not None:
+            deltas.append(delta)
+        per_seed.append({
+            "seed": seed,
+            "n_shared_solved": len(shared),
+            "n_episodes": n_eps,
+            "SR_dqn_greedy": sr_dqn,
+            "SR_heuristic": sr_heur,
+            "gate1_pass": gate1,
+            "mean_steps_dqn_greedy": ms_dqn,
+            "mean_steps_heuristic": ms_heur,
+            "delta": delta,
+        })
+
+    num = len(deltas)
+    mean_delta = float(np.mean(deltas)) if deltas else None
+    n_positive = sum(1 for d in deltas if d > 0)
+    # Paired t-test of the per-seed Deltas vs 0, and a t-interval for the CI (df = num-1).
+    t_stat = ci_low = ci_high = p_two_sided = None
+    if num >= 2:
+        try:
+            from scipy import stats
+            res = stats.ttest_1samp(np.asarray(deltas, dtype=float), 0.0)
+            t_stat = float(res.statistic)
+            p_two_sided = float(res.pvalue)
+            t_crit = float(stats.t.ppf(0.975, df=num - 1))
+        except Exception:
+            arr = np.asarray(deltas, dtype=float)
+            sem0 = float(np.std(arr, ddof=1) / np.sqrt(num))
+            t_stat = float(mean_delta / sem0) if sem0 > 0 else float("inf")
+            t_crit = 2.7764 if num == 5 else 2.0  # df=4 95% two-sided fallback
+        sem = float(np.std(np.asarray(deltas, dtype=float), ddof=1) / np.sqrt(num))
+        ci_low = float(mean_delta - t_crit * sem)
+        ci_high = float(mean_delta + t_crit * sem)
+
+    required_gate1 = 4 if len(seeds) == 5 else int(np.ceil(0.8 * len(seeds)))
+    gate1_ok = gate1_pass_count >= required_gate1
+    gate2_sign_ok = bool(mean_delta is not None and mean_delta > 0 and num == len(seeds) and n_positive == len(seeds))
+    verdict = "WIN" if (gate1_ok and gate2_sign_ok) else "NOT-YET"
+    drivers = []
+    if not gate1_ok:
+        drivers.append(f"Gate1 failed ({gate1_pass_count}/{len(seeds)} < {required_gate1})")
+    if mean_delta is None or mean_delta <= 0:
+        drivers.append("mean Delta not > 0")
+    if num != len(seeds) or n_positive != len(seeds):
+        drivers.append(f"not all seeds positive ({n_positive}/{len(seeds)})")
+    if not drivers:
+        drivers.append(f"Gate1 {gate1_pass_count}/{len(seeds)} and {n_positive}/{len(seeds)} positive Deltas with mean Delta>0")
+
+    sign_test_note = (
+        "5/5 in the winning direction => one-sided sign-test p = 0.031; per METRIC.md the "
+        "directional consistency (not the t p-value) carries significance at n=5."
+        if len(seeds) == 5 else
+        f"{n_positive}/{len(seeds)} positive; sign-test significance per METRIC.md applies at n=5."
+    )
+
+    return {
+        "metric_source": "METRIC.md",
+        "gate1_delta": gate1_delta,
+        "per_seed": per_seed,
+        "deltas": deltas,
+        "mean_delta": mean_delta,
+        "delta_min": float(min(deltas)) if deltas else None,
+        "delta_max": float(max(deltas)) if deltas else None,
+        "t_stat": t_stat,
+        "df": num - 1 if num >= 2 else None,
+        "ci95_mean_delta": [ci_low, ci_high],
+        "t_pvalue_two_sided": p_two_sided,
+        "n_positive_of_total": f"{n_positive}/{len(seeds)}",
+        "sign_test_note": sign_test_note,
+        "gate1_pass_count": gate1_pass_count,
+        "gate1_required": required_gate1,
+        "gate1_ok": gate1_ok,
+        "gate2_sign_ok": gate2_sign_ok,
+        "verdict": verdict,
+        "verdict_drivers": drivers,
+        "decision_rule": "WIN iff Gate1 >= required-of-N within delta AND mean Delta>0 AND all N seeds Delta>0.",
+    }
 
 
 def main() -> None:
@@ -329,11 +471,15 @@ def main() -> None:
     policy_net.eval()
 
     per_run = []
+    per_episode: list[dict[str, Any]] = []
     for seed in args.seeds:
         for policy in POLICIES:
+            # Seed python/numpy once per (policy, seed); the env's torch stream is then
+            # reseeded per episode inside _evaluate_policy for Common Random Numbers.
             _set_global_seed(seed, torch_device)
-            metrics = _evaluate_policy(
+            metrics, episode_rows = _evaluate_policy(
                 policy,
+                seed=seed,
                 n=n,
                 pgen=pgen,
                 pswap=pswap,
@@ -349,6 +495,7 @@ def main() -> None:
             )
             metrics["seed"] = seed
             per_run.append(metrics)
+            per_episode.extend(episode_rows)
 
     summary: dict[str, Any] = {}
     for policy in POLICIES:
@@ -379,6 +526,8 @@ def main() -> None:
         "seeds_positive_of_total": f"{positive}/{len(args.seeds)}",
     }
 
+    gate2 = _compute_gate2(per_episode, list(args.seeds))
+
     payload = {
         "config": {
             "n": n,
@@ -395,11 +544,18 @@ def main() -> None:
         "per_run": per_run,
         "summary": summary,
         "verdict": "BEAT" if beat else "NOT YET",
+        "gate2": gate2,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+    # Per-episode rows (mandatory): joinable on (seed, episode_index) across policies.
+    per_episode_path = os.path.join(os.path.dirname(os.path.abspath(args.out)), "head_to_head_per_episode.json")
+    with open(per_episode_path, "w", encoding="utf-8") as handle:
+        json.dump({"config": payload["config"], "rows": per_episode}, handle, indent=2)
         handle.write("\n")
 
     print("| Policy | mean success | success IQR | mean steps | mean return | truncated frac |")
@@ -412,9 +568,29 @@ def main() -> None:
             f"{_fmt(row['mean_truncated_fraction'])} |"
         )
     print()
-    print(f"paired_delta mean={mean_delta:.4f} std={std_delta:.4f} positive={positive}/{len(args.seeds)}")
-    print(f"verdict: {'BEAT' if beat else 'NOT YET'}")
+    print(f"paired_delta(SR, legacy) mean={mean_delta:.4f} std={std_delta:.4f} positive={positive}/{len(args.seeds)}")
+    print(f"legacy verdict (SR-based): {'BEAT' if beat else 'NOT YET'}")
+    print()
+    print("### Gate 2 (METRIC.md: paired shared-solved steps-to-span)")
+    print("| seed | |shared| | SR_dqn | SR_heur | Gate1 | steps_dqn | steps_heur | Delta |")
+    print("|---|---:|---:|---:|:---:|---:|---:|---:|")
+    for r in gate2["per_seed"]:
+        print(
+            f"| {r['seed']} | {r['n_shared_solved']} | {_fmt(r['SR_dqn_greedy'], '.3f')} | "
+            f"{_fmt(r['SR_heuristic'], '.3f')} | {'pass' if r['gate1_pass'] else 'FAIL'} | "
+            f"{_fmt(r['mean_steps_dqn_greedy'], '.2f')} | {_fmt(r['mean_steps_heuristic'], '.2f')} | "
+            f"{_fmt(r['delta'], '.3f')} |"
+        )
+    ci = gate2["ci95_mean_delta"]
+    print()
+    print(f"mean Delta = {_fmt(gate2['mean_delta'], '.3f')}  (min {_fmt(gate2['delta_min'], '.3f')}, max {_fmt(gate2['delta_max'], '.3f')})")
+    print(f"paired t(df={gate2['df']}) = {_fmt(gate2['t_stat'], '.3f')}, 95% CI = [{_fmt(ci[0], '.3f')}, {_fmt(ci[1], '.3f')}]")
+    print(f"sign consistency: {gate2['n_positive_of_total']} positive. {gate2['sign_test_note']}")
+    print(f"Gate 1: {gate2['gate1_pass_count']}/{len(args.seeds)} pass (need {gate2['gate1_required']}).")
+    print(f"GATE-2 VERDICT: {gate2['verdict']}  ({'; '.join(gate2['verdict_drivers'])})")
+    print()
     print(f"wrote: {args.out}")
+    print(f"wrote: {per_episode_path}")
 
 
 if __name__ == "__main__":
