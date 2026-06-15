@@ -29,16 +29,206 @@ Beyond that, the repository contains:
 - analytical Markov and Monte Carlo utilities for a different problem definition,
 - evaluation scripts and notebooks that export operation counts and derive latency estimates.
 
-There are also several technical reliability issues:
+The Stage-0 DQN path has been strengthened since the first audit. The current
+code now supports the `counter_exposed_plus_ready` observation mode end-to-end,
+separates terminated and truncated episode endings in the replay target,
+validity-masks next-state DQN targets, and exposes Double-DQN, dueling-network,
+and potential-based reward shaping (PBRS) options. The remaining reliability
+issues are therefore more specific:
 
 - the baseline Q-learning exploration rule is wrong,
 - the baseline terminal Q update is wrong,
 - baseline saved models ignore `pgen` and `pswap`,
-- CLI support for `counter_exposed_plus_ready` is broken,
-- DQN target backups do not validity-mask next actions,
-- DQN training reward and evaluation reward are not the same,
-- evaluation success and terminal reward are not aligned,
+- the tabular baseline still observes only adjacency while the richer DQN state
+  includes counters and swap readiness,
+- the published Stage-0 claim is currently a single-training-seed result with
+  five paired evaluation seeds; the 10-training-seed escalation is in progress,
 - notebook workflows depend on missing files and hard-coded external paths.
+
+## Stage-0 result update: figures, method, and physics
+
+Date: 2026-06-15
+
+The current Stage-0 result is a **corrected single-training-seed** result for the
+`n=5`, `pgen=0.4`, `pswap=0.7` repeater-chain task. It should be read as a
+locked Stage-0 result, not as the final 10-training-seed paper result. The
+multi-seed escalation is expected to supersede the single-training-seed headline
+numbers.
+
+The figure source is [`notebooks/stage0_figures.ipynb`](notebooks/stage0_figures.ipynb).
+The generated figure files are:
+
+| Figure | Files | What it supports |
+| --- | --- | --- |
+| Stage-0 collapse fixed | [`figures/fig_stage0_collapse_fixed.pdf`](figures/fig_stage0_collapse_fixed.pdf), [`figures/fig_stage0_collapse_fixed.png`](figures/fig_stage0_collapse_fixed.png) | The corrected Stage-0 training path removes the late greedy-evaluation collapse seen in the earlier checkpoint sweep. |
+| Paired per-seed step delta | [`figures/fig_stage0_paired_delta.pdf`](figures/fig_stage0_paired_delta.pdf), [`figures/fig_stage0_paired_delta.png`](figures/fig_stage0_paired_delta.png) | On identical shared-solved evaluation instances, the learned policy uses about 21 fewer steps than the swap-as-soon-as-possible heuristic. |
+| Paired scatter | [`figures/fig_stage0_paired_scatter.pdf`](figures/fig_stage0_paired_scatter.pdf), [`figures/fig_stage0_paired_scatter.png`](figures/fig_stage0_paired_scatter.png) | Episode-level paired comparison: most shared-solved instances lie below the `y=x` diagonal, meaning DQN steps are fewer than heuristic steps. |
+| Leave-one-out ablation | [`figures/fig_stage0_ablation.pdf`](figures/fig_stage0_ablation.pdf), [`figures/fig_stage0_ablation.png`](figures/fig_stage0_ablation.png) | Double-DQN is the largest stabilizer in this Stage-0 stack; dueling and PBRS help incrementally once the termination/truncation fix is in place. |
+
+![Stage-0 collapse fixed](figures/fig_stage0_collapse_fixed.png)
+
+![Stage-0 paired per-seed delta](figures/fig_stage0_paired_delta.png)
+
+![Stage-0 paired scatter](figures/fig_stage0_paired_scatter.png)
+
+![Stage-0 ablation](figures/fig_stage0_ablation.png)
+
+### Stage-0 training configuration
+
+The Stage-0 full-stack run is:
+
+- run directory: `qamel/outputs/runs/dqn_n5_pgen0.4_pswap0.7_stage0_fullstack_s12345/`,
+- checkpoint used for evaluation: `checkpoints/best_eval.pt`,
+- chain size: `n=5`,
+- elementary generation probability: `pgen=0.4`,
+- swap success probability: `pswap=0.7`,
+- observation mode: `counter_exposed_plus_ready`,
+- architecture: dueling DQN head,
+- target update: Double-DQN target selection/evaluation split,
+- reward: base environment reward plus PBRS during training,
+- PBRS scale: `1.0`,
+- training seed: `12345`,
+- training episodes: `10000`,
+- max actions per episode: `100`,
+- best-eval cadence: every `1000` training episodes, evaluated over `200` episodes,
+- optimizer settings for the Stage-0 escalation path: learning rate `5e-4`, batch size `256`.
+
+This is deliberately narrower than the repository's older multipartite-grid
+framing. It is a controlled DQN result for a one-dimensional chain.
+
+### Stage-0 physical interpretation
+
+The physical substrate represented by the executable environment is a repeater
+chain, not a two-dimensional quantum network. Each node is a station with quantum
+memory; adjacent stations can attempt elementary Bell-pair generation, and an
+interior station with two incident links can attempt entanglement swapping.
+
+The environment state has three physical/control channels:
+
+- `state[0]`: binary link adjacency; a `1` means an entangled link is currently present,
+- `state[1]`: per-node generation-attempt counters on the diagonal,
+- `state[2]`: per-node swap-attempt counters on the diagonal.
+
+The Stage-0 DQN also observes a fourth derived channel in
+`counter_exposed_plus_ready`: a global swap-readiness signal equal to the number
+of interior nodes whose degree is two. That signal is not a new physical process;
+it is a compact control feature exposing when the chain has local Bell pairs in a
+configuration that can be contracted by swapping.
+
+At each discrete environment step the policy chooses a structured action matrix:
+
+- one-off-diagonal entries request elementary generation on nearest-neighbor chain segments,
+- interior diagonal entries request swaps at repeater nodes,
+- invalid actions are masked so the policy cannot intentionally exceed degree constraints or request swaps at nodes that are not ready.
+
+Generation and swap outcomes are Bernoulli trials. A successful elementary
+generation creates a nearest-neighbor Bell pair. A successful swap consumes two
+shorter links at an interior node and creates a longer link between the two
+outer endpoints. Repeating this contraction process can eventually create the
+terminal end-to-end link between node `0` and node `n-1`.
+
+The model intentionally omits several physical effects: no fidelity, decoherence,
+dark counts, memory lifetime, purification, classical signaling time, routing
+delay, or wavelength/channel contention are included. Therefore the Stage-0
+claim is about **control efficiency in discrete repeater-chain scheduling**:
+given the same stochastic link-generation and swap process, the learned policy
+spans the chain in fewer decision steps than the heuristic while preserving
+equal-or-better success.
+
+### Stage-0 RL method
+
+The Stage-0 DQN stack uses four changes that matter scientifically and
+algorithmically.
+
+First, terminated and truncated episodes are separated. A true terminal event is
+success or a bad state. A time-limit cutoff is a truncation: the episode stopped
+because `max_actions` was reached, not because the MDP reached an absorbing
+failure. The Bellman target therefore masks bootstrap only on true termination,
+not on truncation. This avoids teaching the DQN that every time-limited state has
+zero continuation value.
+
+Second, the next-state target is validity-masked. Acting-time masking alone is
+not enough: if the target backup takes a maximum over invalid actions, the
+network can overestimate impossible continuations. Stage-0 computes the valid
+action mask for each next state and applies it before the max or before the
+Double-DQN argmax.
+
+Third, Double-DQN and the dueling head address two different instability modes.
+Double-DQN uses the policy network to choose the best valid next action and the
+target network to evaluate that action, reducing maximization bias. The dueling
+head decomposes each action value as
+
+```text
+Q(s, a) = V(s) + A(s, a) - mean_a A(s, a),
+```
+
+which lets the network learn a state value separately from action advantages.
+This is helpful in repeater-chain states where many actions are similarly poor
+or similarly good, especially before a swap-ready configuration appears.
+
+Fourth, PBRS uses a bounded state potential `Phi(s)` equal to the length of the
+longest contiguous run of elementary links starting at node `0`. The shaping term
+is
+
+```text
+F(s, s') = gamma * Phi(s') - Phi(s).
+```
+
+Because this term is potential-based and depends only on states, it preserves the
+optimal policy while giving the learner denser feedback about physical progress
+toward spanning the chain. It should be interpreted as a learning aid, not as a
+new physical reward in the evaluation metric.
+
+### Stage-0 evaluation method
+
+The head-to-head comparison follows [`METRIC.md`](METRIC.md). The evaluated
+policies are:
+
+- `dqn_greedy`: the learned DQN argmax policy with state-valid masking and no heuristic filter,
+- `heuristic`: the non-neural prefer-swap-when-ready policy,
+- `dqn_swapprefer`: reported only as a reference because it includes the heuristic filter.
+
+The comparison uses `1000` evaluation episodes for each of five evaluation seeds:
+`12345`, `23456`, `34567`, `45678`, and `56789`. The environment is seeded so
+the same episode index is the same stochastic problem instance across policies.
+That enables a paired comparison.
+
+The pre-registered decision rule has two ordered gates:
+
+1. Gate 1: DQN success must be non-inferior to the heuristic, with tolerance
+   `delta = 0.02`.
+2. Gate 2: on the shared-solved episode set, compute
+   `Delta = heuristic steps - DQN steps`; the DQN wins only if the mean Delta is
+   positive and all five evaluation seeds have positive Delta.
+
+For the Stage-0 single-training-seed result:
+
+| Metric | Value |
+| --- | ---: |
+| DQN greedy success rate | `0.9874` |
+| Heuristic success rate | `0.8550` |
+| DQN greedy mean steps | `17.2091` |
+| Heuristic mean steps | `38.1017` |
+| Shared-solved paired mean Delta | `21.1889` steps |
+| 95% paired-t CI for mean Delta | `[20.2454, 22.1325]` |
+| Positive evaluation seeds | `5/5` |
+| Gate verdict | `WIN` |
+
+The per-seed paired deltas are all positive:
+
+| Eval seed | Shared solved episodes | DQN SR | Heuristic SR | Delta steps |
+| --- | ---: | ---: | ---: | ---: |
+| `12345` | 843 | 0.985 | 0.858 | 20.650 |
+| `23456` | 854 | 0.983 | 0.869 | 22.145 |
+| `34567` | 837 | 0.990 | 0.844 | 20.416 |
+| `45678` | 862 | 0.991 | 0.868 | 20.896 |
+| `56789` | 827 | 0.988 | 0.836 | 21.838 |
+
+These values support the narrow Stage-0 claim: on this fixed `n=5` chain
+configuration and this single trained checkpoint, the DQN reaches higher success
+than the heuristic and spans the same shared-solved instances in about half as
+many steps. They do not establish generalization across chain length,
+probability settings, or multipartite/fusion physics.
 
 ## Repository overview
 
@@ -96,15 +286,17 @@ The implemented reward is:
 
 - `-1` for each nonterminal step,
 - `-100` for a bad/truncated state,
-- `1000 / torch.amax(chain_state)` on terminal success ([`qamel/utils.py#L109`](qamel/utils.py#L109)).
+- `100` on terminal success ([`qamel/utils.py#L109`](qamel/utils.py#L109)).
 
-Because `chain_state` includes operation-counter channels, terminal reward depends on the **maximum value anywhere in the state tensor**, which in practice is dominated by the largest generation/swap counter. So the agent is effectively optimizing a mix of:
+So the base environment reward is primarily a sparse success/timeout signal
+with a per-step cost. It optimizes:
 
 - fewer elapsed steps,
-- fewer peak local attempts,
-- avoidance of bad states.
+- successful end-to-end spanning,
+- avoidance of bad states and timeouts.
 
-This differs from the README wording and also differs from the DQN training reward whenever swap bonuses are enabled.
+PBRS can add a potential-based training signal, but evaluation return remains
+the unshaped environment return.
 
 ## Full architecture of the codebase
 
@@ -357,21 +549,27 @@ Those are not equivalent. In the provided saved baseline CSV, 26 episodes are si
 
 `reward_shape()` is:
 
-- terminal: `1000 / torch.amax(chain_state).item()`,
+- terminal: `100`,
 - bad/truncated: `-100`,
 - otherwise: `-1` ([`qamel/utils.py#L109`](qamel/utils.py#L109)).
 
-Important implication: because `torch.amax` is taken over the full 3-channel tensor, terminal reward is effectively based on the maximum local attempt counter anywhere in the state, not total operations.
+Important implication: the base reward does not directly price physical latency,
+number of generation attempts, or number of swap attempts. Those quantities are
+logged as metrics, while the reward incentivizes reaching the end-to-end link
+quickly and avoiding bad states/timeouts.
 
-### Observation / reward mismatch
+### Observation richness
 
 The baseline tabular learner chooses actions from `current_state[0]` only ([`scripts/train_qamel.py#L50`](scripts/train_qamel.py#L50)).
 
-But reward depends on channels `1` and `2`.
+The richer DQN modes additionally expose the counter channels and, for
+`counter_exposed_plus_ready`, the swap-readiness feature. Those channels do not
+change the physical transition model, but they help the learner distinguish
+otherwise similar adjacency states during training.
 
-Therefore the baseline observation is **not Markov** with respect to the reward actually used.
-
-The DQN with `counter_exposed` is closer to the true state because it sees the counter channels.
+The tabular baseline is therefore a weaker control baseline for the Stage-0
+stack: it has less state information and no neural generalization over
+nearby chain configurations.
 
 ## RL methods implemented
 
@@ -460,7 +658,8 @@ Each entry stores:
 - action index,
 - reward,
 - next observation,
-- done flag.
+- terminated flag,
+- truncated flag.
 
 #### Target network logic
 
@@ -486,36 +685,43 @@ Hyperparameters in `dqn_hyperparameters`:
 
 At acting time, DQN computes valid action indices with `_get_valid_action_indices()` and sets invalid Q-values to `-1e9` before `argmax` ([`scripts/train_qamel.py#L221`](scripts/train_qamel.py#L221), [`scripts/train_qamel.py#L228`](scripts/train_qamel.py#L228)).
 
-However, the target backup uses:
+The current Stage-0 DQN path also builds a next-state valid-action mask for the
+Bellman target. In ordinary DQN mode, invalid next-action Q-values are masked
+before the target max. In Double-DQN mode, the policy network selects the best
+valid next action and the target network evaluates it.
 
-```python
-next_q = target_net(next_obs_batch).max(1, keepdim=True)[0]
-```
-
-without validity masking ([`scripts/train_qamel.py#L264`](scripts/train_qamel.py#L264)). This can overestimate impossible next actions.
+This is an important correctness detail: acting-time masking alone does not stop
+the target backup from overestimating impossible actions.
 
 #### Loss function
 
-The code uses MSE loss ([`scripts/train_qamel.py#L268`](scripts/train_qamel.py#L268)) and Adam optimization ([`scripts/train_qamel.py#L177`](scripts/train_qamel.py#L177)).
+The current DQN path uses SmoothL1/Huber loss, Adam optimization, and gradient
+clipping at norm `10.0`.
 
-There is no:
+Supported stabilizers now include:
 
-- Huber loss,
-- Double DQN,
-- gradient clipping,
-- prioritized replay.
+- target network updates,
+- state-valid action masking for acting and targets,
+- optional Double-DQN,
+- optional dueling network architecture,
+- optional PBRS.
+
+Prioritized replay is not implemented.
 
 #### Additional reward shaping
 
-DQN training optionally adds:
+DQN training can use potential-based reward shaping:
 
 ```text
-swap_ready_bonus * ready_nodes
+F(s, s') = gamma * Phi(s') - Phi(s)
 ```
 
-if the chosen action is swap-ready ([`scripts/train_qamel.py#L240`](scripts/train_qamel.py#L240)).
+where `Phi(s)` is the longest contiguous run of elementary links starting at
+node `0`.
 
-Evaluation does **not** add this bonus, so training and evaluation optimize/report different returns.
+Evaluation does not add the shaping term, so reported returns and success rates
+remain on the base task. Because the term is potential-based, it preserves the
+optimal policy while changing the training signal.
 
 ### What changed and what stayed the same between tabular and DQN
 
@@ -584,10 +790,11 @@ Summary metrics:
 `total_return` in evaluation is the accumulated sum of:
 
 - `-1` for each nonterminal step,
-- plus a terminal reward `1000 / max(counter)`,
+- plus a terminal reward `100`,
 - or `-100` if the episode is bad/timeout.
 
-For DQN models trained with `swap_ready_bonus`, evaluation return is not the same objective the policy trained against.
+For PBRS-trained DQN models, evaluation return is intentionally unshaped: it is
+the base environment return, not the shaped replay reward.
 
 ### Saved evaluation results present in the repository
 
@@ -647,14 +854,18 @@ python scripts/train_qamel.py --n 5 --pgen 0.4 --pswap 0.7 --model_tag baseline
 
 ### DQN training
 
-As currently written, the CLI only reliably reaches the DQN branch for `counter_exposed`:
-
 ```bash
 python scripts/train_qamel.py \
   --n 5 --pgen 0.4 --pswap 0.7 \
-  --obs_mode counter_exposed \
-  --model_tag counter_exposed \
-  --train_episodes 10000
+  --obs_mode counter_exposed_plus_ready \
+  --seed 12345 \
+  --reward_mode base \
+  --model_tag stage0_fullstack_s12345 \
+  --train_episodes 10000 \
+  --max_actions 100 \
+  --best_eval_every 1000 \
+  --best_eval_episodes 200 \
+  --double-dqn --dueling --pbrs --pbrs-scale 1.0
 ```
 
 ### Baseline evaluation
@@ -681,10 +892,10 @@ python scripts/evaluate_qamel.py \
 
 - baseline Q-tables are keyed only by `n`, not by `pgen`/`pswap`,
 - some saved evaluation outputs do not have corresponding saved checkpoints,
-- `counter_exposed_plus_ready` is listed but not properly wired through CLI logic,
+- `notebooks/agent_latencies.py` is still syntactically broken,
 - notebook workflows depend on missing result files and absolute external paths,
 - no version pinning,
-- no seed control,
+- seed control exists for Stage-0 DQN runs but is not consistently documented across legacy workflows,
 - no tests.
 
 ## Problems and limitations
@@ -711,20 +922,20 @@ python scripts/evaluate_qamel.py \
 6. **Baseline file naming ignores environment parameters.**
    - [`scripts/train_qamel.py#L365`](scripts/train_qamel.py#L365) stores by `n` only.
 
-7. **Step timeout is not consistently stored as terminal in DQN replay.**
-   - Replay `done` is written before timeout check ([`scripts/train_qamel.py#L246`](scripts/train_qamel.py#L246), [`scripts/train_qamel.py#L276`](scripts/train_qamel.py#L276)).
+7. **Legacy and Stage-0 result sets should not be mixed without labels.**
+   - Older diagnostic outputs were produced before the Stage-0 termination/truncation and DQN-target fixes. The new Stage-0 figures should be described separately from those older diagnostics.
 
-8. **Bellman targets are not validity-masked.**
-   - [`scripts/train_qamel.py#L264`](scripts/train_qamel.py#L264)
+8. **The Stage-0 claim is still single-training-seed.**
+   - The head-to-head comparison uses five paired evaluation seeds, but only one trained checkpoint. The ongoing 10-training-seed escalation is required before making a final paper-level robustness claim.
 
-9. **Training reward and evaluation reward differ for DQN.**
-   - `swap_ready_bonus` appears only in training.
+9. **PBRS changes the training signal.**
+   - It is potential-based and should preserve the optimal policy, but ablations are still needed to quantify how much of the observed sample efficiency comes from the shaping term versus Double-DQN and dueling architecture.
 
-10. **Success metric and reward are inconsistent.**
-   - `final_state=True, bad_state=True` can still receive terminal reward.
+10. **The old analytical latency pipeline is not directly coupled to Stage-0.**
+   - The Stage-0 metric is discrete decision steps, not physical wall-clock latency. Additional modeling is needed before translating the learned policy into the latency claims used in the broader paper framing.
 
-11. **Tabular observation is non-Markov for the implemented reward.**
-   - adjacency-only state IDs do not include counters.
+11. **The tabular baseline is not an apples-to-apples modern DQN baseline.**
+   - It observes less state, has known update bugs, and is mostly useful as legacy context rather than as the headline comparator.
 
 12. **Existing links can be re-attempted.**
    - validity logic only counts absent new edges, but `step()` clears and resamples acted-on links.
@@ -732,9 +943,8 @@ python scripts/evaluate_qamel.py \
 13. **`step()` has an inconsistent return type on one branch.**
    - [`qamel/environment.py#L44`](qamel/environment.py#L44) returns `(-100, state_copy)` instead of a state tensor.
 
-14. **CLI handling for `counter_exposed_plus_ready` is broken.**
-   - training branch only checks for exact string `"counter_exposed"` ([`scripts/train_qamel.py#L316`](scripts/train_qamel.py#L316)),
-   - evaluation remaps unsupported modes back to baseline ([`scripts/evaluate_qamel.py#L299`](scripts/evaluate_qamel.py#L299)).
+14. **Legacy documentation still needs cleanup.**
+   - Some README/report language predates the Stage-0 fixes and still frames the executable RL task more broadly than the code supports.
 
 ### Reproducibility issues
 
@@ -742,7 +952,7 @@ python scripts/evaluate_qamel.py \
 16. **Hard-coded Windows paths in notebooks.**
 17. **Broken helper script `notebooks/agent_latencies.py`.**
 18. **No tests.**
-19. **No seed control.**
+19. **Seed control is unevenly documented across legacy workflows.**
 20. **No pinned versions.**
 
 ### Scaling issues
@@ -795,11 +1005,11 @@ To scale:
 
 1. Decide on one scientific problem definition and align README, code, and notebooks.
 2. Fix baseline exploration and Q updates.
-3. Make reward, success, and evaluation consistent.
-4. Mask invalid next actions in DQN targets.
-5. Fix CLI handling for observation modes.
-6. Parameterize output filenames by environment and model config.
-7. Add tests and deterministic seeds.
+3. Finish the 10-training-seed Stage-0 escalation and regenerate the figure set with aggregate seed statistics.
+4. Parameterize remaining legacy output filenames by environment and model config.
+5. Add tests for episode status, action validity, target masking, and PBRS invariance.
+6. Document deterministic seed handling for every training/evaluation entry point.
+7. Repair notebook paths and the broken `notebooks/agent_latencies.py` helper.
 8. Only after that, start scaling or extending the physics.
 
 ## Minimal changes needed to get this code working reliably
@@ -815,19 +1025,19 @@ Priority order:
    - correct terminal Q update,
    - state-valid action masking.
 
-3. **Fix reward / metric consistency.**
-   - unify training and evaluation reward,
-   - decide whether `final && bad` is success or failure,
-   - decide whether the objective is steps, total operations, max local load, or latency.
+3. **Keep reward / metric wording precise.**
+   - Stage-0 evaluates success and decision steps, not full physical latency.
+   - PBRS is a training-only shaping term; reported returns are base returns.
+   - Do not mix pre-fix diagnostic metrics with Stage-0 fixed-path metrics.
 
-4. **Fix DQN backup logic.**
-   - validity-mask next-state actions when computing targets.
+4. **Finish the multi-training-seed escalation.**
+   - The single-training-seed Stage-0 result is strong but not the final robustness claim.
 
 5. **Fix artifact naming.**
    - include `n`, `pgen`, `pswap`, `obs_mode`, and `model_tag` in saved outputs.
 
-6. **Fix CLI mode support.**
-   - make `counter_exposed_plus_ready` usable end-to-end.
+6. **Update user-facing project framing.**
+   - Make clear that the executable result is repeater-chain Bell-pair scheduling, while grid/multipartite/fusion remains analytical or future work.
 
 7. **Repair notebook pipeline.**
    - remove absolute paths,
