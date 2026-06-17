@@ -60,7 +60,7 @@ python scripts/train_qamel.py \
   --n 5 --pgen 0.4 --pswap 0.7 \
   --obs_mode counter_exposed_plus_ready \
   --seed "${SEED}" --reward_mode base \
-  --train_episodes 10000 --max_actions 100 \
+  --train_episodes 10000 \
   --checkpoint_every 0 --log_every 100 \
   --best_eval_every 1000 --best_eval_episodes 200 \
   --double-dqn --dueling --pbrs --pbrs-scale 1.0 \
