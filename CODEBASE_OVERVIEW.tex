@@ -40,7 +40,7 @@
 \title{Qamel / Timing-Multiuser-Protocols:\\
 A Complete Codebase Reference for Collaborating Models}
 \author{Internal technical memo\\(generated for the Claude $\leftrightarrow$ Claude Code collaboration loop)}
-\date{June 15, 2026}
+\date{June 17, 2026}
 
 \begin{document}
 \maketitle
@@ -52,7 +52,7 @@ This document is a self-contained reference to the \code{Timing-Multiuser-Protoc
 \tableofcontents
 \clearpage
 
-\section{Latest Implementation and Result Log (through June 15, 2026)}
+\section{Latest Implementation and Result Log (through June 17, 2026)}
 \label{sec:latest-log}
 
 This log records the current state of the reinforcement-learning branch after the June 11, 2026 integration pass.
@@ -67,6 +67,268 @@ This log records the current state of the reinforcement-learning branch after th
   \item Current syntax/import checks pass for \code{qamel.dqn}, \code{qamel.utils}, \code{scripts.train\_qamel}, \code{scripts.evaluate\_qamel}, and \code{scripts.head\_to\_head}. No long training run was executed as part of this log.
 \end{itemize}
 
+\subsection{Lab notebook entry: Myriad status on June 17, 2026}
+\label{sec:lablog-2026-06-17}
+
+The cluster status check on UCL Myriad found no active queued/running jobs from
+\code{qstat -u "\$USER"}. The submitted artifacts are therefore either completed,
+failed, or terminated by the scheduler. The relevant evidence came from
+\file{qamel/outputs/studies/*/cross\_budget\_summary.csv},
+\file{qamel/outputs/cluster\_logs/*.out}, and
+\file{qamel/outputs/stage0\_escalation\_logs/*.out}.
+
+\begin{center}
+\begin{tabular}{llrrl}
+\toprule
+Run tag & Source & Budget & Success rate & Status \\
+\midrule
+\code{lq\_n5\_seed12345\_progressive} & Myriad archive & 1{,}000 & 0.024 & archived \\
+\code{lq\_n5\_seed12345\_progressive} & Myriad archive & 5{,}000 & 0.506 & archived \\
+\code{lq\_n5\_seed12345\_progressive} & Myriad archive & 10{,}000 & 0.904 & archived \\
+\code{lq\_n5\_seed12345\_progressive} & checkpoint dir & 11{,}000 & -- & checkpoint exists, no eval archive \\
+\code{lq\_n6\_seed12345\_progressive} & Myriad archive & 1{,}000 & 0.162 & archived \\
+\code{lq\_n6\_seed12345\_progressive} & Myriad archive & 2{,}000 & 0.012 & archived \\
+\code{lq\_n6\_seed12345\_progressive} & Myriad archive & 3{,}000 & 0.208 & archived \\
+\code{lq\_n6\_seed12345\_progressive} & Myriad archive & 4{,}000 & 0.000 & archived \\
+\code{swapaware\_seed12345} & Myriad archive & 200 & 0.204 & archived, later resume failed \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Interpretation:
+\begin{itemize}
+  \item The strongest confirmed cluster result remains the single-seed $n=5$,
+  $\pgen=0.4$, $\pswap=0.7$ progressive run at 10{,}000 training episodes:
+  success rate $0.904$, mean return $58.618$, mean steps $23.182$, and
+  truncated fraction $0.096$ over a 500-episode greedy evaluation.
+  \item The planned 20{,}000-episode continuation for that same $n=5$ run did
+  start and wrote \file{episode\_011000.pt}, but no
+  \file{budget\_20000/eval\_summary.json} was archived. The current lab-book
+  state is therefore ``10{,}000 complete; 20{,}000 incomplete'', not ``20{,}000
+  failed scientifically''.
+  \item The submitted Stage-0 escalation array
+  \file{qamel/outputs/stage0\_escalation\_logs/qamel\_s0\_esc.612520.*.out}
+  did not train. Every task exited at argument parsing with
+  \code{unrecognized arguments: --max\_actions 100 --double-dqn --dueling --pbrs
+  --pbrs-scale 1.0 --lr 5e-4 --batch\_size 256}. This is an operational
+  failure: the Myriad checkout was stale and did not contain the newer training
+  CLI flags.
+  \item Later $n=6$ progressive submissions attempted to resume an old
+  checkpoint whose hidden width was 512, while the current $n=6$ model width is
+  768 under the formula in \S\ref{sec:rl}. The resulting
+  \code{size mismatch} is expected; $n=6$ must be restarted under a fresh run tag
+  or after moving the legacy checkpoint directory aside.
+  \item The \code{swapaware\_seed12345} run archived a 200-episode evaluation but
+  then failed on resume because the stale cluster code tried to restore an RNG
+  state that was not a \code{torch.ByteTensor}. The current local training code
+  converts restored RNG tensors before calling \code{torch.random.set\_rng\_state},
+  but this must be confirmed on Myriad after a clean \code{git pull}.
+\end{itemize}
+
+Immediate operational conclusion: before any new Stage-0, dueling, Double-DQN,
+PBRS, or publication-suite job is submitted on Myriad, the cluster checkout must
+be made clean enough for \code{git pull --ff-only}. Otherwise the scheduler will
+keep running older scripts that reject the new flags.
+
+\subsection{Lab notebook entry: Myriad workflow on June 17, 2026}
+\label{sec:lablog-myriad-procedure-2026-06-17}
+
+This is the current working Myriad checklist. It duplicates the practical note
+in \file{MYRIAD\_WORKFLOW.md} so that the CodeOverview PDF is self-contained.
+It is an operating procedure, not a scientific result.
+
+\subsubsection*{Login and repository}
+\begin{verbatim}
+ssh ucapgoz@myriad.rc.ucl.ac.uk
+cd /home/ucapgoz/Timing-Multiuser-Protocols
+\end{verbatim}
+
+All qsub wrappers assume:
+\begin{verbatim}
+/home/ucapgoz/Timing-Multiuser-Protocols
+\end{verbatim}
+
+\subsubsection*{Module and virtual-environment setup}
+Two virtual environments were found:
+\begin{verbatim}
+/home/ucapgoz/venvs/timing-multiuser
+/home/ucapgoz/venvs/dqn-env
+\end{verbatim}
+
+Use \file{/home/ucapgoz/venvs/timing-multiuser}. Do not use
+\file{/home/ucapgoz/venvs/dqn-env} for current jobs; it failed with:
+\begin{verbatim}
+python: error while loading shared libraries: libpython3.11.so.1.0
+\end{verbatim}
+
+Important ordering: \code{timing-multiuser} only sees PyTorch after the Myriad
+PyTorch module is loaded. Activating the venv first in a plain login shell led to
+\code{ModuleNotFoundError: No module named 'torch'}.
+
+Known-good setup sequence:
+\begin{verbatim}
+deactivate 2>/dev/null || true
+
+module unload compilers mpi gcc-libs 2>/dev/null || true
+module load gcc-libs/10.2.0
+module load python3/3.9-gnu-10.2.0
+module load pytorch/2.1.0/gpu
+
+source /home/ucapgoz/venvs/timing-multiuser/bin/activate
+\end{verbatim}
+
+Validate the environment before submitting:
+\begin{verbatim}
+which python
+python -V
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+python -c "import qamel.dqn; import qamel.utils; import scripts.head_to_head; print('imports ok')"
+\end{verbatim}
+
+On the login node, \code{torch.cuda.is\_available()} can print \code{False};
+this is expected. In a GPU qsub job, the log should print
+\code{cuda\_available True}. The verified login-node smoke check on June 17,
+2026 was:
+\begin{verbatim}
+Python 3.9.6
+torch 2.1.0+cu121
+imports ok
+\end{verbatim}
+
+\subsubsection*{Git hygiene before qsub}
+Before submitting cluster jobs, make sure Myriad is actually running the current
+code:
+\begin{verbatim}
+git status --short
+git pull --ff-only
+python -c "import qamel.dqn; import qamel.utils; import scripts.head_to_head; print('imports ok after pull')"
+\end{verbatim}
+
+If the checkout is dirty, the Git version on Myriad may reject
+\code{git stash push -u}. Use the older syntax:
+\begin{verbatim}
+git stash save -u "myriad pre-pull $(date +%Y%m%d-%H%M%S)"
+git pull --ff-only
+\end{verbatim}
+
+This matters: the first Stage-0 escalation array failed because Myriad still had
+an older \file{scripts/train\_qamel.py}. The stale script rejected:
+\begin{verbatim}
+--max_actions 100 --double-dqn --dueling --pbrs --pbrs-scale 1.0 --lr 5e-4 --batch_size 256
+\end{verbatim}
+
+Treat cluster results as untrusted unless the log proves the job ran after a
+clean pull/import check.
+
+\subsubsection*{Submitting jobs}
+Stage-0 escalation array:
+\begin{verbatim}
+qsub scripts/myriad_stage0_escalation_array.sh
+qstat -u "$USER"
+\end{verbatim}
+
+This array uses task IDs 1--8 and writes logs to:
+\begin{verbatim}
+qamel/outputs/stage0_escalation_logs/
+\end{verbatim}
+
+Expected early GPU-job log lines:
+\begin{verbatim}
+cuda_available True
+device_count 1
+device_name NVIDIA A100 80GB PCIe
+\end{verbatim}
+
+Publication suite:
+\begin{verbatim}
+EXPERIMENT_SET=n5_canonical qsub scripts/qsub_publication_suite.sh
+EXPERIMENT_SET=n6_prelim qsub scripts/qsub_publication_suite.sh
+EXPERIMENT_SET=n5_dueling_double qsub scripts/qsub_publication_suite.sh
+EXPERIMENT_SET=n5_dueling_double_pbrs qsub scripts/qsub_publication_suite.sh
+\end{verbatim}
+
+The publication qsub wrapper delegates to
+\file{scripts/myriad\_publication\_suite.sh} and
+\file{scripts/run\_stage2\_study.sh}, and writes logs to:
+\begin{verbatim}
+qamel/outputs/myriad_logs/
+\end{verbatim}
+
+Older Stage-2 wrappers still exist:
+\begin{verbatim}
+qsub scripts/qsub_myriad_stage2_lq_n5_seed12345_progressive.sh
+qsub scripts/qsub_myriad_stage2_lq_n6_seed12345_progressive.sh
+qsub scripts/qsub_myriad_stage2_swapaware_seed12345.sh
+\end{verbatim}
+Use these only when intentionally reproducing the older progressive-study
+workflow. They write to \file{qamel/outputs/cluster\_logs}.
+
+\subsubsection*{Monitoring jobs and logs}
+\begin{verbatim}
+qstat -u "$USER"
+
+find qamel/outputs -maxdepth 3 -type d \( -name "*log*" -o -name "*logs*" \) -print
+
+tail -n 120 qamel/outputs/stage0_escalation_logs/*.out 2>/dev/null
+tail -n 120 qamel/outputs/myriad_logs/*.out 2>/dev/null
+tail -n 120 qamel/outputs/cluster_logs/*.out 2>/dev/null
+\end{verbatim}
+
+Search for high-signal lines:
+\begin{verbatim}
+grep -RInE "cuda_available|Success rate|Cross-budget|verdict|Traceback|error|size mismatch|unrecognized" \
+  qamel/outputs/stage0_escalation_logs qamel/outputs/myriad_logs qamel/outputs/cluster_logs 2>/dev/null
+\end{verbatim}
+
+Print archived Stage-2 budget summaries:
+\begin{verbatim}
+for f in qamel/outputs/studies/*/cross_budget_summary.csv; do
+  echo
+  echo "== $f =="
+  cat "$f"
+done
+\end{verbatim}
+
+\subsubsection*{Known Myriad results and failures}
+\begin{itemize}
+  \item \textbf{Confirmed $n=5$ progressive result.}
+  \code{lq\_n5\_seed12345\_progressive} reached success rate $0.904$ at budget
+  10{,}000, with mean return $58.618$, mean steps $23.182$, truncated fraction
+  $0.096$, and 500 evaluation episodes. The same run has
+  \file{episode\_011000.pt}, but no archived \file{budget\_20000} evaluation.
+  Cite it as 10k complete, not 20k complete.
+  \item \textbf{Stage-0 array failure.} The first Stage-0 escalation array did
+  not test the science; it failed during argument parsing because the Myriad
+  checkout was stale.
+  \item \textbf{$n=6$ checkpoint mismatch.} Some old $n=6$ checkpoints use hidden
+  width 512. The current $n=6$ model with \code{counter\_exposed\_plus\_ready}
+  uses hidden width 768. Use a fresh run tag for new $n=6$ jobs, or move the old
+  run directory aside.
+  \item \textbf{Swapaware resume failure.} The old \code{swapaware\_seed12345}
+  run archived a 200-episode eval but later failed restoring RNG state. Current
+  local code converts restored RNG tensors before setting RNG state; confirm on
+  Myriad after a clean pull before trusting resumed swapaware jobs.
+\end{itemize}
+
+\subsubsection*{Quick pre-submission checklist}
+\begin{verbatim}
+cd /home/ucapgoz/Timing-Multiuser-Protocols
+
+module unload compilers mpi gcc-libs 2>/dev/null || true
+module load gcc-libs/10.2.0
+module load python3/3.9-gnu-10.2.0
+module load pytorch/2.1.0/gpu
+source /home/ucapgoz/venvs/timing-multiuser/bin/activate
+
+git status --short
+git pull --ff-only
+
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import qamel.dqn; import qamel.utils; import scripts.head_to_head; print('imports ok')"
+
+qstat -u "$USER"
+\end{verbatim}
+
 \section{Stage-0 Result Update (June 15, 2026)}
 \label{sec:stage0-update}
 
@@ -76,6 +338,13 @@ document the method and the physics interpretation, but it should not be
 presented as the final paper robustness claim until the 10-training-seed
 escalation finishes. The figure source is \file{notebooks/stage0\_figures.ipynb};
 the figures below are written under \file{figures/}.
+
+Important June 17 lab-note caveat: the submitted Myriad Stage-0 escalation array
+did \emph{not} test this scientific claim. It failed during CLI parsing because
+the cluster checkout was stale and did not yet contain the newer
+\code{--dueling}, \code{--double-dqn}, \code{--pbrs}, learning-rate, batch-size,
+and max-action flags. The failed array is therefore an operations/checkouts
+failure, not evidence that the Stage-0 method failed.
 
 \begin{figure}[htbp]
   \centering
@@ -640,19 +909,24 @@ The canonical preset is \file{configs/phase2\_baseline\_n5\_plus\_ready.json}:
 \end{lstlisting}
 The corresponding \file{BASELINE.md} pins this as the benchmark preset and documents the exact train/evaluate invocations.
 
-\subsection{Reported result}
-\code{README.md} reports the following result on this preset:
+\subsection{Reported result and current Myriad archive state}
+\code{README.md} reports the following result on this preset, now confirmed in
+the Myriad archive for the single-seed progressive $n=5$ run:
 \begin{center}
-\begin{tabular}{rrr}
+\begin{tabular}{rrrl}
 \toprule
-$n$ & Budget & Success rate \\
+$n$ & Budget & Success rate & Lab status \\
 \midrule
-5 & 10{,}000 & 90.4\% \\
-6 & 20{,}000 & in progress \\
+5 & 10{,}000 & 90.4\% & archived and confirmed \\
+5 & 20{,}000 & -- & started, checkpointed at 11{,}000, no archived eval \\
+6 & 4{,}000 & 0.0\% & archived old progressive run \\
+6 & 5{,}000+ & -- & later resume failed from checkpoint-width mismatch \\
 \bottomrule
 \end{tabular}
 \end{center}
-These are the numbers cited at submission time; the Myriad scripts (\S\ref{sec:stage2}) chase larger budgets for both $n$ values.
+These are the numbers cited at submission time plus the June 17, 2026 Myriad
+status. Larger $n=5$ budgets and any fresh $n=6$ claim still require clean
+resubmission after the cluster checkout is updated.
 
 \subsection{Myriad / qsub wrappers}
 \file{scripts/myriad\_stage2\_lq\_seed12345\_progressive.sh}, \file{...\_n5...}, \file{...\_n6...intermediate.sh}, \file{...\_n6...progressive.sh}, and \code{qsub\_*} variants are minor wrappers around \file{run\_stage2\_study.sh} that set module loads, environment activation, and SGE qsub flags before delegating.
@@ -722,6 +996,9 @@ This list is distilled from \file{REPORT.md} and from the code itself. Items 1--
   \item \textbf{Existing links can be ``refreshed.''} \code{is\_action\_valid\_given\_state} counts only newly added edges in degree budgeting, but \code{step()} clears and re-samples acted-on edges regardless of whether they were already present. Whether this is a feature (lets the agent reroll a partially built chain) or a bug is a design call.
   \item \textbf{\code{step()} has an inconsistent return type.} The early-exit branch on \code{len(connected\_nodes) > 2} returns \code{(-100, state\_copy)} instead of a state tensor. Callers don't currently hit this branch because \code{is\_action\_valid\_given\_state} masks it out, but the code path is a latent footgun.
   \item \textbf{CLI for \code{counter\_exposed\_plus\_ready}.} The current CLI handles this mode correctly end to end (see \code{DQN\_OBS\_MODES} in both scripts). Keep this mode covered by smoke tests so it does not regress.
+  \item \textbf{Myriad checkout drift can invalidate submitted jobs.} The June 17 Stage-0 escalation array failed before training because Myriad still had an older \file{scripts/train\_qamel.py} that rejected the newer \code{--dueling}, \code{--double-dqn}, \code{--pbrs}, learning-rate, batch-size, and max-action flags. Treat cluster submissions as untrusted until \code{git pull --ff-only} and a Python import check have succeeded on Myriad.
+  \item \textbf{$n=6$ checkpoint-width compatibility.} The current hidden-width formula gives $H=768$ for $n=6$ with \code{counter\_exposed\_plus\_ready}. Legacy $n=6$ checkpoints with $H=512$ cannot be resumed into the current \code{DQNNet}; they should be kept as historical artifacts and future $n=6$ runs should use a fresh run tag.
+  \item \textbf{Incomplete $n=5$ 20k continuation.} The strongest archived $n=5$ Myriad result is still the 10{,}000-episode evaluation at 90.4\% success. A later continuation wrote \file{episode\_011000.pt} but no \file{budget\_20000} archive, so it should not be cited as a completed 20k result.
   \item Notebooks pin Windows paths; \file{notebooks/agent\_latencies.py} has an indentation bug at line~34 that breaks execution.
   \item No tests. No pinned versions.
   \item State enumeration scales as $2^{\binom{n}{2}}$ before filtering, so the tabular pathway dies at $n=7$ in practice.
@@ -845,6 +1122,8 @@ Manhattan distance for the grid topology, power-of-2 decomposition (used to choo
   \item \file{README.md}: project framing and quick-start.
   \item \file{BASELINE.md}: canonical phase-2 preset; train and evaluate commands.
   \item \file{MYRIAD\_STAGE2.md}: cluster workflow and overwrite semantics.
+  \item \file{MYRIAD\_WORKFLOW.md}: current Myriad login, module, venv, git,
+  qsub, monitoring, and known-failure checklist.
   \item \file{REPORT.md}: a long, audit-style technical report. The single best document for an external collaborator who wants to understand what was checked in at a given snapshot. Many findings in REPORT.md are now resolved; the list in \S\ref{sec:issues} above is the up-to-date subset.
   \item \file{OFC\_paper\_2025.pdf}: published framing; broader scope than the executable RL.
   \item \file{LICENSE}: MIT.
