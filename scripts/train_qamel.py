@@ -1075,6 +1075,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_tag", type=str, default="baseline")
     parser.add_argument("--obs_mode", type=str, choices=["baseline", "counter_exposed", "counter_exposed_plus_ready"], default=None)
     parser.add_argument("--train_episodes", type=int, default=None)
+    parser.add_argument("--max_actions", type=int, default=100)
     parser.add_argument("--force_train", action="store_true")
     parser.add_argument("--swap_ready_bonus", type=float, default=0.5)
     parser.add_argument("--reward_mode", type=str, choices=sorted(SUPPORTED_REWARD_MODES), default="base")
@@ -1101,6 +1102,9 @@ if __name__ == "__main__":
     env_vars_class = parser.parse_args()
     env_vars = env_vars_class.__dict__
     _set_global_seed(env_vars_class.seed, torch_device)
+    # Episode horizon is now CLI-overridable (default 100 keeps existing behavior); this
+    # replaces the hardcoded module global so every downstream use picks up --max_actions.
+    max_actions = env_vars_class.max_actions
 
     this_hyperparameters = hyperparameters
     this_dqn_hyperparameters = dqn_hyperparameters
