@@ -29,19 +29,27 @@ set -euo pipefail
 # Kept cheap: only 3 seeds.
 # =====================================================================================
 
-# ============================ TUNABLES (retune after first seed) ============================
+# ============================ TUNABLES (v2 — mirror the n=6 stability fixes) =================
+# Apply the SAME v2 fixes as n=6 so this stays a clean control: a weak n=7 result must be
+# attributable to the flat head over 233 actions, NOT to under-tuning (else a reviewer dismisses
+# it). The ε-at-floor problem is worse here (60k budget): v1 eps_decay=45k floored ε by ~ep1150.
+#   * EPS_DECAY 45k -> 450k : ramp over ~first 20% of the run (scaled to the larger n=7 budget).
+#   * LR 5e-4 -> 2e-4       : same Q-overestimation fix as n=6.
+#   * BEST_EVAL_MAX_ACTIONS 100 -> 200 : align best-eval horizon with the n=7 training/gate (200).
+#   * RUN_TAG -> *_v2_*     : fresh tag, no collision with the v1 baseline runs.
 N="${N:-7}"
 PGEN="${PGEN:-0.4}"
 PSWAP="${PSWAP:-0.7}"
 SEEDS=(202 303 404)
 TRAIN_EPISODES="${TRAIN_EPISODES:-60000}"
 MAX_ACTIONS="${MAX_ACTIONS:-200}"
-EPS_DECAY="${EPS_DECAY:-45000}"
+EPS_DECAY="${EPS_DECAY:-450000}"
 CURRICULUM_BOUNDARIES="${CURRICULUM_BOUNDARIES:-20000,40000}"
 CURRICULUM_STEPS="${CURRICULUM_STEPS:-50,100,200}"
 BEST_EVAL_EVERY="${BEST_EVAL_EVERY:-3000}"
 BEST_EVAL_EPISODES="${BEST_EVAL_EPISODES:-200}"
-LR="${LR:-5e-4}"
+BEST_EVAL_MAX_ACTIONS="${BEST_EVAL_MAX_ACTIONS:-200}"
+LR="${LR:-2e-4}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 EVAL_EPISODES="${EVAL_EPISODES:-1000}"
 EVAL_SEEDS="${EVAL_SEEDS:-12345 23456 34567 45678 56789}"
@@ -61,7 +69,7 @@ cd "${REPO_ROOT}"
 
 TASK_ID="${SGE_TASK_ID:-1}"
 SEED="${SEEDS[$((TASK_ID - 1))]}"
-RUN_TAG="flathead_n7_s${SEED}"
+RUN_TAG="flathead_n7_v2_s${SEED}"
 RUN_NAME="dqn_n${N}_pgen${PGEN}_pswap${PSWAP}_${RUN_TAG}"
 RUN_DIR="qamel/outputs/runs/${RUN_NAME}"
 BEST_EVAL="${RUN_DIR}/checkpoints/best_eval.pt"
@@ -71,7 +79,7 @@ echo "host=$(hostname)"
 echo "task_id=${TASK_ID}"
 echo "seed=${SEED}"
 echo "run_name=${RUN_NAME}"
-echo "tunables: n=${N} train_episodes=${TRAIN_EPISODES} max_actions=${MAX_ACTIONS} eps_decay=${EPS_DECAY} curriculum=${CURRICULUM_BOUNDARIES}/${CURRICULUM_STEPS}"
+echo "tunables: n=${N} train_episodes=${TRAIN_EPISODES} max_actions=${MAX_ACTIONS} eps_decay=${EPS_DECAY} lr=${LR} best_eval_max_actions=${BEST_EVAL_MAX_ACTIONS} curriculum=${CURRICULUM_BOUNDARIES}/${CURRICULUM_STEPS}"
 python - <<'PY'
 import torch
 print("cuda_available", torch.cuda.is_available())
@@ -104,6 +112,7 @@ python scripts/train_qamel.py \
   --use_curriculum --curriculum_boundaries "${CURRICULUM_BOUNDARIES}" --curriculum_steps "${CURRICULUM_STEPS}" \
   --checkpoint_every 0 --log_every 200 \
   --best_eval_every "${BEST_EVAL_EVERY}" --best_eval_episodes "${BEST_EVAL_EPISODES}" \
+  --best_eval_max_actions "${BEST_EVAL_MAX_ACTIONS}" \
   --double-dqn --dueling --pbrs --pbrs-scale 1.0 \
   --lr "${LR}" --batch_size "${BATCH_SIZE}" \
   --force_train \

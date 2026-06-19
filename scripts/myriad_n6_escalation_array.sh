@@ -18,27 +18,36 @@
 
 set -euo pipefail
 
-# ============================ TUNABLES (retune after first seed) ============================
-# Rationale for the first-pass n=6 values vs the n=5 defaults:
-#   * MAX_ACTIONS 100 -> 150 : longer chain needs more steps to reach the end-to-end link.
-#   * EPS_DECAY  10k  -> 30k : more env steps to terminal at n=6, so explore longer.
-#   * CURRICULUM            : n=5 defaults only exercised two horizons; scale boundaries to
-#                             the 40k budget so the agent sees 40 -> 80 -> 150 horizons.
-#   * TRAIN_EPISODES 10k -> 40k : bigger state/action space (89 actions, width 768) needs more.
-# After the first seed finishes, read truncated_fraction + mean steps and retune horizon /
-# episodes / eps-decay before trusting the full set.
+# ============================ TUNABLES (v2 retune after first canary) =======================
+# v1 (eps_decay=30k, lr=5e-4, best_eval horizon=100) showed learn-then-collapse at n=6:
+# s202 peaked 0.62 greedy @ ep6k then fell to 0.25; s303 never left ~0.02. Diagnosis: ε pinned
+# at the 0.05 floor for ~98% of the run (30k env steps ~= ep900 of 40k) + too-high LR at width
+# 768 / 89 actions -> Q-overestimation oscillation with no exploration left to recover.
+# v2 changes (change ONLY the diagnosed levers; keep horizon/curriculum/episodes fixed so the
+# fix is attributable):
+#   * EPS_DECAY 30k -> 250k : ramp ε down over the first ~20% of the run (~ep8k), not ~ep900,
+#                             so a dipping policy can re-explore back out of the collapse.
+#   * LR 5e-4 -> 2e-4       : canonical fix for learn-then-collapse / moving-target oscillation.
+#   * BEST_EVAL_MAX_ACTIONS 100 -> 150 : BUG FIX. best-eval ran at horizon 100 while training and
+#                             the gate use 150, so "best" was selected at the wrong horizon
+#                             (failing seeds read mean_steps ~98 = truncation at 100, not 150).
+#   * RUN_TAG -> *_v2_*     : fresh tag so this relaunch never collides with / resumes the v1
+#                             runs and their frozen best_eval.pt artifacts stay intact.
+# Next lever if v2 still collapses (do NOT stack now): --prefer_swap_when_ready_train, or
+# soften the target sync 1000 -> 2000 (needs a CLI flag; not exposed yet), or the factored head.
 N="${N:-6}"
 PGEN="${PGEN:-0.4}"
 PSWAP="${PSWAP:-0.7}"
 SEEDS=(202 303 404 505 606 707 808 909)
 TRAIN_EPISODES="${TRAIN_EPISODES:-40000}"
 MAX_ACTIONS="${MAX_ACTIONS:-150}"
-EPS_DECAY="${EPS_DECAY:-30000}"
+EPS_DECAY="${EPS_DECAY:-250000}"
 CURRICULUM_BOUNDARIES="${CURRICULUM_BOUNDARIES:-15000,30000}"
 CURRICULUM_STEPS="${CURRICULUM_STEPS:-40,80,150}"
 BEST_EVAL_EVERY="${BEST_EVAL_EVERY:-2000}"
 BEST_EVAL_EPISODES="${BEST_EVAL_EPISODES:-200}"
-LR="${LR:-5e-4}"
+BEST_EVAL_MAX_ACTIONS="${BEST_EVAL_MAX_ACTIONS:-150}"
+LR="${LR:-2e-4}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 EVAL_EPISODES="${EVAL_EPISODES:-1000}"
 EVAL_SEEDS="${EVAL_SEEDS:-12345 23456 34567 45678 56789}"
@@ -58,7 +67,7 @@ cd "${REPO_ROOT}"
 
 TASK_ID="${SGE_TASK_ID:-1}"
 SEED="${SEEDS[$((TASK_ID - 1))]}"
-RUN_TAG="stage0_fullstack_n6_s${SEED}"
+RUN_TAG="stage0_fullstack_n6_v2_s${SEED}"
 RUN_NAME="dqn_n${N}_pgen${PGEN}_pswap${PSWAP}_${RUN_TAG}"
 RUN_DIR="qamel/outputs/runs/${RUN_NAME}"
 BEST_EVAL="${RUN_DIR}/checkpoints/best_eval.pt"
@@ -68,7 +77,7 @@ echo "host=$(hostname)"
 echo "task_id=${TASK_ID}"
 echo "seed=${SEED}"
 echo "run_name=${RUN_NAME}"
-echo "tunables: n=${N} train_episodes=${TRAIN_EPISODES} max_actions=${MAX_ACTIONS} eps_decay=${EPS_DECAY} curriculum=${CURRICULUM_BOUNDARIES}/${CURRICULUM_STEPS}"
+echo "tunables: n=${N} train_episodes=${TRAIN_EPISODES} max_actions=${MAX_ACTIONS} eps_decay=${EPS_DECAY} lr=${LR} best_eval_max_actions=${BEST_EVAL_MAX_ACTIONS} curriculum=${CURRICULUM_BOUNDARIES}/${CURRICULUM_STEPS}"
 python - <<'PY'
 import torch
 print("cuda_available", torch.cuda.is_available())
@@ -103,6 +112,7 @@ python scripts/train_qamel.py \
   --use_curriculum --curriculum_boundaries "${CURRICULUM_BOUNDARIES}" --curriculum_steps "${CURRICULUM_STEPS}" \
   --checkpoint_every 0 --log_every 200 \
   --best_eval_every "${BEST_EVAL_EVERY}" --best_eval_episodes "${BEST_EVAL_EPISODES}" \
+  --best_eval_max_actions "${BEST_EVAL_MAX_ACTIONS}" \
   --double-dqn --dueling --pbrs --pbrs-scale 1.0 \
   --lr "${LR}" --batch_size "${BATCH_SIZE}" \
   --force_train \
