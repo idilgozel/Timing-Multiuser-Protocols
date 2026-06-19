@@ -40,7 +40,7 @@
 \title{Qamel / Timing-Multiuser-Protocols:\\
 A Complete Codebase Reference for Collaborating Models}
 \author{Internal technical memo\\(generated for the Claude $\leftrightarrow$ Claude Code collaboration loop)}
-\date{June 17, 2026}
+\date{June 19, 2026}
 
 \begin{document}
 \maketitle
@@ -52,7 +52,7 @@ This document is a self-contained reference to the \code{Timing-Multiuser-Protoc
 \tableofcontents
 \clearpage
 
-\section{Latest Implementation and Result Log (through June 17, 2026)}
+\section{Latest Implementation and Result Log (through June 19, 2026)}
 \label{sec:latest-log}
 
 This log records the current state of the reinforcement-learning branch after the June 11, 2026 integration pass.
@@ -129,6 +129,168 @@ Immediate operational conclusion: before any new Stage-0, dueling, Double-DQN,
 PBRS, or publication-suite job is submitted on Myriad, the cluster checkout must
 be made clean enough for \code{git pull --ff-only}. Otherwise the scheduler will
 keep running older scripts that reject the new flags.
+
+\subsection{Lab notebook entry: $n=6$ no-go and $n=7$ control status on June 19, 2026}
+\label{sec:lablog-2026-06-19-n6-n7}
+
+The running Myriad arrays were inspected using both the rolling training proxy
+and every available greedy best-evaluation check. The greedy trajectories change
+the interpretation: the current $n=6$ configuration is unstable rather than
+merely slow to learn. It is a \textbf{no-go for a full multi-seed claim}. The
+already-running tasks are pilots; held seeds should not be released under this
+configuration.
+
+\begin{center}
+\small
+\begin{tabular}{p{0.08\textwidth}p{0.58\textwidth}p{0.25\textwidth}}
+\toprule
+Seed & Greedy evaluation trajectory & Interpretation \\
+\midrule
+202 & $0.03 \rightarrow 0.62$ (6k) $\rightarrow 0.51$ (8k) $\rightarrow 0.25$ (10k)
+    & learn then collapse \\
+303 & stored peak $0.68$ (4k); $0.025 \rightarrow 0.020 \rightarrow 0.005 \rightarrow 0.015$ (10k--16k)
+    & early peak then near-dead \\
+404 & $0.08 \rightarrow 0.63$ (4k)
+    & healthy so far, still in danger window \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For seed 202, the rolling training proxy had also fallen to $0.005$ at episode
+10{,}400, confirming that the live policy was nearly dead after its 0.62 greedy
+peak. The frozen \file{best\_eval.pt} protects the peak artifact from subsequent
+degradation. Seed 303 likewise had an early stored 0.68 checkpoint, but its
+later greedy checks stayed around 1--2\% with mean steps near 98, indicating
+near-constant truncation. This corrects the initial shorthand that seed 303
+``never learned'': the complete evidence instead shows a still stronger
+learn-then-collapse failure. Seed 404 had reached 0.63 at episode 4{,}000, but
+seed 202 was similarly healthy at that age before failing. The current read is
+therefore two collapsed seeds and one not-yet-failed seed, versus the clean
+$8/8$ $n=5$ Stage-0 result.
+
+\subsubsection*{Working diagnosis}
+
+The dominant configuration problem is the exploration schedule. In
+\file{scripts/train\_qamel.py}, \code{eps\_decay\_steps} is measured in
+environment steps through \code{steps\_done}, not in episodes. The $n=6$ array
+sets it to only 30{,}000 even though the full run is of order 1.3 million or more
+environment steps; seed 202 had already accumulated roughly 133k steps by
+episode 4{,}000. Epsilon consequently reaches its 0.05 floor by roughly episode
+900 and stays there for about 98\% of training. A degraded policy therefore has
+almost no exploratory mechanism with which to recover.
+
+The remaining stability settings plausibly amplify this failure at the larger
+$n=6$ network/action scale: the array uses a 768-wide network, learning rate
+$5\times10^{-4}$, hard target synchronisation every 1{,}000 environment steps,
+and gradient clipping at 10.0. The observed early rise followed by a sharp,
+persistent drop is consistent with catastrophic forgetting and Q-value
+overestimation or moving-target oscillation. This is a working diagnosis, not a
+separately instrumented Q-value measurement.
+
+There is also a measurement/configuration bug. The wrappers set the training and
+final gate horizon to 150 actions for $n=6$ and 200 for $n=7$, but do not pass
+\code{--best\_eval\_max\_actions}; checkpoint selection therefore uses its
+default horizon of 100. This explains failing greedy checks with mean steps near
+98 and means that ``best'' checkpoint selection is not aligned with the final
+head-to-head gate.
+
+The training horizon itself is \emph{not} the indicated lever. Seed 202's 0.62
+peak had mean steps 49, showing that the chain is solvable well inside the
+existing limit. Keep \code{MAX\_ACTIONS=150}, the curriculum, and the 40k episode
+budget; align best-eval with that horizon rather than increasing it.
+
+\subsubsection*{Recommended fresh-tag retune}
+
+If the diagnosis is confirmed, terminate the current $n=6$ pilots and relaunch
+fresh tags with \code{--force\_train}; do not resume these unstable checkpoints.
+Apply changes in this priority order:
+
+\begin{enumerate}
+  \item Increase \code{EPS\_DECAY} from 30{,}000 to approximately 250{,}000
+  environment steps so exploration decays over roughly the first 20\% of the
+  run rather than its opening few percent.
+  \item Lower the learning rate from $5\times10^{-4}$ to $2\times10^{-4}$.
+  \item Pass \code{--best\_eval\_max\_actions 150} so checkpoint selection and
+  the final $n=6$ gate use the same horizon.
+  \item Optionally increase hard target synchronisation from 1{,}000 to 2{,}000
+  environment steps to damp oscillation; this is secondary to exploration and
+  learning-rate changes.
+\end{enumerate}
+
+One cheap confirmation remains available before terminating tasks: allow seed
+404 to reach roughly episodes 8k--10k. A peak near 0.62 followed by the same drop
+would reproduce the failure naturally. This confirmation is useful but does not
+change the retune path.
+
+The $n=7$ flat-head run remains a deliberate weak control over roughly 233
+unfactored actions. Its episode-12k candidate for seed 202 was 0.215, while the
+stored earlier best was 0.615 at episode 9k. To make the control scientifically
+clean, it should receive the analogous slower epsilon decay, lower learning
+rate, and \code{--best\_eval\_max\_actions 200}; otherwise weak performance can
+be attributed to under-tuning rather than to the flat action head. This was the
+state at diagnosis time; the follow-up implementation below records the applied
+wrapper changes and operational response.
+
+\subsubsection*{Follow-up action and v2 implementation record}
+
+The operational response reported from Myriad was to preserve the $n=6$ seed-404
+task as a free confirmation through approximately episodes 8k--10k, delete the
+collapsed seed-202 and seed-303 tasks plus pending $n=6$ v1 work, and delete the
+$n=7$ v1 control array. These scheduler actions are user-reported in this local
+overview; they cannot be independently reconstructed from the repository.
+
+The corresponding wrapper retune is verified in commit
+\code{a1cd14e} (present on \code{main} and \code{origin/main}). The implementation
+changes are:
+
+\begin{center}
+\small
+\begin{tabular}{p{0.27\textwidth}p{0.27\textwidth}p{0.37\textwidth}}
+\toprule
+Lever & $n=6$ v2 & $n=7$ v2 \\
+\midrule
+\code{EPS\_DECAY} & 30k $\rightarrow$ 250k & 45k $\rightarrow$ 450k \\
+\code{LR} & $5\times10^{-4} \rightarrow 2\times10^{-4}$
+          & $5\times10^{-4} \rightarrow 2\times10^{-4}$ \\
+Best-eval horizon & 100 $\rightarrow$ 150 & 100 $\rightarrow$ 200 \\
+Run tag & \code{stage0\_fullstack\_n6\_v2\_s*}
+        & \code{flathead\_n7\_v2\_s*} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Both wrappers now expose \code{BEST\_EVAL\_MAX\_ACTIONS} as an overridable
+tunable, pass it explicitly to
+\code{--best\_eval\_max\_actions}, and print it with epsilon decay and learning
+rate in the initial canary diagnostics. The fresh v2 run tags, combined with
+\code{--force\_train}, prevent collision with or accidental resume from v1 and
+preserve the frozen v1 \file{best\_eval.pt} artifacts.
+
+The retune intentionally leaves the training horizon, three-phase curriculum,
+episode budgets, architecture, PBRS, Double-DQN, dueling head, batch size, and
+hard target-update interval unchanged. The training-time prefer-swap option also
+remains off. This isolates the slower exploration decay, lower learning rate,
+and corrected checkpoint-selection horizon as the diagnosed changes. A 2{,}000
+step target interval is not included because the interval is currently fixed at
+1{,}000 in \file{scripts/train\_qamel.py}, with no CLI override.
+
+The relaunch protocol is deliberately sequential:
+
+\begin{enumerate}
+  \item Pull commit \code{a1cd14e} on Myriad and submit only $n=6$ array task 1
+  as the v2 canary.
+  \item Near episode 2k, verify that the logged epsilon remains materially above
+  0.05. Reaching the floor there means the intended schedule is not active.
+  \item Near episodes 10k--12k, require the greedy best-eval trajectory to remain
+  high rather than repeating the v1 peak-then-collapse pattern.
+  \item Release $n=6$ tasks 2--8 only after the canary survives that collapse
+  window. Re-canary $n=7$ afterward rather than launching its full array first.
+\end{enumerate}
+
+If v2 still collapses despite slower exploration and the lower learning rate,
+the next controlled levers are training-time prefer-swap and a configurable
+softer target update. A repeated failure would promote the factored action head
+from an $n=7$ scaling improvement to the primary path for both $n=6$ and $n=7$.
 
 \subsection{Lab notebook entry: Myriad workflow on June 17, 2026}
 \label{sec:lablog-myriad-procedure-2026-06-17}

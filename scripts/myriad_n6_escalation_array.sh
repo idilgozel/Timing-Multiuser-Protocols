@@ -20,9 +20,10 @@ set -euo pipefail
 
 # ============================ TUNABLES (v2 retune after first canary) =======================
 # v1 (eps_decay=30k, lr=5e-4, best_eval horizon=100) showed learn-then-collapse at n=6:
-# s202 peaked 0.62 greedy @ ep6k then fell to 0.25; s303 never left ~0.02. Diagnosis: ε pinned
-# at the 0.05 floor for ~98% of the run (30k env steps ~= ep900 of 40k) + too-high LR at width
-# 768 / 89 actions -> Q-overestimation oscillation with no exploration left to recover.
+# s202 peaked 0.62 greedy @ ep6k then fell to 0.25; s303 stored an early 0.68 peak @ ep4k,
+# then fell to ~0.01--0.02 by ep10k--16k. Diagnosis: ε pinned at the 0.05 floor for ~98% of
+# the run (30k env steps ~= ep900 of 40k) + too-high LR at width 768 / 89 actions ->
+# Q-overestimation oscillation with no exploration left to recover.
 # v2 changes (change ONLY the diagnosed levers; keep horizon/curriculum/episodes fixed so the
 # fix is attributable):
 #   * EPS_DECAY 30k -> 250k : ramp ε down over the first ~20% of the run (~ep8k), not ~ep900,
