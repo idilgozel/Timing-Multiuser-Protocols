@@ -40,7 +40,7 @@
 \title{Qamel / Timing-Multiuser-Protocols:\\
 A Complete Codebase Reference for Collaborating Models}
 \author{Internal technical memo\\(generated for the Claude $\leftrightarrow$ Claude Code collaboration loop)}
-\date{June 19, 2026}
+\date{June 21, 2026}
 
 \begin{document}
 \maketitle
@@ -52,7 +52,7 @@ This document is a self-contained reference to the \code{Timing-Multiuser-Protoc
 \tableofcontents
 \clearpage
 
-\section{Latest Implementation and Result Log (through June 19, 2026)}
+\section{Latest Implementation and Result Log (through June 21, 2026)}
 \label{sec:latest-log}
 
 This log records the current state of the reinforcement-learning branch after the June 11, 2026 integration pass.
@@ -291,6 +291,108 @@ If v2 still collapses despite slower exploration and the lower learning rate,
 the next controlled levers are training-time prefer-swap and a configurable
 softer target update. A repeated failure would promote the factored action head
 from an $n=7$ scaling improvement to the primary path for both $n=6$ and $n=7$.
+
+\subsection{Lab notebook entry: completed $n=6$ v2 canary on June 21, 2026}
+\label{sec:lablog-2026-06-21-n6-v2}
+
+The first retuned $n=6$ canary completed on Myriad as array job
+\code{634779.1}, training seed 202. The evidence is the cluster log
+\file{qamel/outputs/n6\_escalation\_logs/qamel\_n6\_esc.634779.1.out} and the
+result written to
+\file{qamel/outputs/runs/dqn\_n6\_pgen0.4\_pswap0.7\_stage0\_fullstack\_n6\_v2\_s202/head\_to\_head.json}.
+No other v2 training seed is represented in this captured result, so this is a
+\textbf{single-training-seed canary}, not an eight-seed $n=6$ result.
+
+The job ran on a Tesla V100 for 47{,}080 seconds (13:04:20) and completed all
+40{,}000 training episodes. It used the intended v2 settings:
+\code{MAX\_ACTIONS=150}, \code{EPS\_DECAY=250000},
+\code{LR=2e-4}, \code{BEST\_EVAL\_MAX\_ACTIONS=150}, and the
+$40/80/150$ curriculum at episode boundaries 15k and 30k. The checkpoint was
+successfully stripped to 4{,}182{,}932 bytes before evaluation.
+
+\subsubsection*{Greedy best-evaluation trajectory}
+
+The current-policy greedy checks evolved as follows; these are 200-episode
+checkpoint-selection evaluations, not the later five-seed head-to-head:
+
+\begin{center}
+\small
+\begin{tabular}{rrrrrr}
+\toprule
+Episode & Success & Episode & Success & Episode & Success \\
+\midrule
+2k  & 0.000 & 4k  & 0.000 & 6k  & 0.095 \\
+8k  & 0.515 & 10k & 0.630 & 12k & 0.590 \\
+14k & 0.640 & 16k & 0.610 & 18k & 0.615 \\
+20k & 0.660 & 22k & 0.695 & 24k & 0.750 \\
+26k & 0.715 & 28k & 0.680 & 30k & 0.750 \\
+32k & 0.545 & 34k & 0.530 & 36k & 0.605 \\
+38k & 0.705 & 40k & 0.645 &     &       \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The stored best checkpoint was first reached at episode 24k with success 0.750,
+mean return $-2.785$, and mean steps 53.785. The current policy dipped after the
+final curriculum transition but recovered from 0.530 at 34k to 0.705 at 38k,
+ending at 0.645. This is materially better than the v1 near-dead collapse, but
+the late oscillation means that stability is improved rather than solved.
+
+\subsubsection*{Five-seed paired head-to-head from the stored checkpoint}
+
+The frozen best checkpoint was evaluated for 1{,}000 episodes under each of five
+environment seeds at the aligned 150-action horizon:
+
+\begin{center}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Policy & Mean success & Success IQR & Mean steps & Mean return & Truncated \\
+\midrule
+\code{dqn\_greedy}     & 0.6992 & 0.0310 & 20.10 & $-18.33$ & 0.3008 \\
+\code{dqn\_swapprefer} & 0.8596 & 0.0140 & 21.06 &  33.76   & 0.1404 \\
+\code{heuristic}       & 0.8188 & 0.0050 & 59.35 & $-11.03$ & 0.1812 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For the policy under test, the mean success-rate difference
+\code{dqn\_greedy - heuristic} was $-0.1196$ (standard deviation 0.0239), with
+zero of five evaluation seeds positive. The legacy success-rate verdict was
+therefore \textbf{NOT YET}. The swap-prefer-filtered DQN exceeded the heuristic
+by 0.0408 mean success, but it remains a reference diagnostic: it incorporates
+the heuristic filter and cannot replace the unfiltered greedy policy in the
+headline comparison.
+
+On the paired, shared-solved episodes, the unfiltered greedy DQN was much faster:
+
+\begin{center}
+\small
+\begin{tabular}{rrrrrrrr}
+\toprule
+Eval seed & Shared & SR DQN & SR heur. & Gate 1 & Steps DQN & Steps heur. & $\Delta$ \\
+\midrule
+12345 & 585 & 0.713 & 0.806 & fail & 19.35 & 56.13 & 36.779 \\
+23456 & 548 & 0.682 & 0.813 & fail & 21.27 & 56.25 & 34.984 \\
+34567 & 606 & 0.729 & 0.818 & fail & 20.03 & 59.08 & 39.048 \\
+45678 & 590 & 0.696 & 0.842 & fail & 20.51 & 59.36 & 38.847 \\
+56789 & 567 & 0.676 & 0.815 & fail & 18.46 & 57.40 & 38.940 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Here $\Delta=\text{steps}_{\mathrm{heuristic}}-\text{steps}_{\mathrm{DQN}}$.
+The mean was 37.720 steps (range 34.984--39.048), with
+$t(4)=46.975$, 95\% confidence interval $[35.490,39.949]$, and all five signs
+positive (one-sided sign-test $p=0.031$). However, Gate 1---success no worse than
+two percentage points below the heuristic---failed on all five seeds, versus
+four required. The emitted two-gate verdict is therefore \textbf{NOT-YET}.
+
+\file{METRIC.md} pre-registered this rule for the $n=5$ task, not $n=6$;
+applying the same machinery here is a disciplined diagnostic rather than a new
+pre-registered $n=6$ claim. The canary supports releasing further $n=6$ v2 seeds
+if the goal is to measure robustness, but it does not yet establish that the
+unfiltered $n=6$ DQN is non-inferior in success to the heuristic.
 
 \subsection{Lab notebook entry: Myriad workflow on June 17, 2026}
 \label{sec:lablog-myriad-procedure-2026-06-17}
