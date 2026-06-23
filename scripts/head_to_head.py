@@ -16,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from qamel.environment import RepeaterChain
 from qamel.utils import (
+    action_swaps_ready_node,
     check_if_bad_state,
     check_if_final_state,
     compute_reward,
@@ -23,6 +24,7 @@ from qamel.utils import (
     generate_all_valid_actions,
     get_episode_status,
     is_action_valid_given_state,
+    ready_interior_nodes,
 )
 from qamel.dqn import build_dqn_net, preprocess_obs
 
@@ -103,10 +105,9 @@ def _valid_action_indices(state0: torch.Tensor, all_actions: torch.Tensor) -> li
 
 
 def _ready_interior_nodes(state0: torch.Tensor) -> list[int]:
-    if state0.size(0) <= 2:
-        return []
-    degrees = torch.count_nonzero(state0, dim=1)
-    return [int(idx.item()) + 1 for idx in (degrees[1:-1] == 2).nonzero(as_tuple=False).flatten()]
+    # Delegates to the shared rule in qamel.utils so training-time swap guidance and eval are
+    # guaranteed identical. Kept as a re-export: diagnose_q_tie_stalls.py imports this name.
+    return ready_interior_nodes(state0)
 
 
 def _action_has_generation(action_matrix: torch.Tensor) -> bool:
@@ -121,8 +122,8 @@ def _action_has_swap(action_matrix: torch.Tensor) -> bool:
 
 
 def _action_swaps_ready_node(action_matrix: torch.Tensor, ready_nodes: list[int]) -> bool:
-    diag = torch.diagonal(action_matrix, 0)
-    return any(bool(diag[node].item() > 0) for node in ready_nodes)
+    # Shared rule (see qamel.utils.action_swaps_ready_node); re-exported for the diagnostic.
+    return action_swaps_ready_node(action_matrix, ready_nodes)
 
 
 def _generation_only_action(action_matrix: torch.Tensor) -> bool:

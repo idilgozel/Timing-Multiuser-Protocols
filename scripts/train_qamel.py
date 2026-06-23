@@ -15,6 +15,7 @@ import time
 import random
 import json
 import csv
+import bisect
 from collections import deque
 import torch.nn as nn
 import torch.optim as optim
@@ -22,7 +23,7 @@ from rich.progress import track
 
 from qamel.utils import generate_all_valid_actions, linear_schedule
 from qamel.dqn import DQNNet, build_dqn_net, preprocess_obs
-from qamel.utils import chain_progress_potential_batch
+from qamel.utils import chain_progress_potential_batch, ready_node_swap_action_indices
 
 def train_q_agent(env_vars, hyperparameter_configs, **kwargs):
 
@@ -612,6 +613,10 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     best_eval_metrics_path = kwargs["best_eval_metrics_path"]
     best_eval_checkpoint_path = kwargs["best_eval_checkpoint_path"]
     prefer_swap_when_ready_train = kwargs["prefer_swap_when_ready_train"]
+    swap_guidance = kwargs.get("swap_guidance", "off")
+    swap_guidance_prob = kwargs.get("swap_guidance_prob", 0.5)
+    target_swap_mask = kwargs.get("target_swap_mask", False)
+    step_penalty = kwargs.get("step_penalty", 0.0)
     dueling = kwargs.get("dueling", False)
     double_dqn = kwargs.get("double_dqn", False)
     pbrs = kwargs.get("pbrs", False)
@@ -716,21 +721,16 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
     phase = None
     for episode in track(range(start_episode, training_episodes), description="Training DQN agent..."):
         if use_curriculum:
-            if episode < curriculum_boundaries[0]:
-                current_limit = curriculum_steps[0]
-                if phase != 0:
-                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
-                    phase = 0
-            elif episode < curriculum_boundaries[1]:
-                current_limit = curriculum_steps[1]
-                if phase != 1:
-                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
-                    phase = 1
-            else:
-                current_limit = curriculum_steps[2]
-                if phase != 2:
-                    print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
-                    phase = 2
+            # General N-stage step-limit curriculum. curriculum_boundaries is a sorted list of
+            # the first episode of each new stage; curriculum_steps has exactly one more entry
+            # than boundaries. bisect_right maps the current episode to its stage index. This
+            # generalizes the old hardcoded 3-stage ladder (so n=7's 4-stage 60->120->200->300
+            # works) and reproduces the previous behavior exactly for the 2- and 3-stage configs.
+            new_phase = bisect.bisect_right(curriculum_boundaries, episode)
+            current_limit = curriculum_steps[new_phase]
+            if phase != new_phase:
+                print(f"Curriculum phase at episode {episode}: max_actions={current_limit}")
+                phase = new_phase
         cumulative_reward = 0
         step = 0
         done = False
@@ -751,23 +751,49 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
             ready_nodes_steps += 1
             obs = preprocess_obs(current_state, obs_mode, hyperparameter_configs.counter_norm).to(torch_device)
             valid_indices = _get_valid_action_indices(current_state[0], all_actions)
-            selected_valid_indices = _filter_training_action_indices(
-                current_state[0],
-                all_actions,
-                valid_indices,
-                prefer_swap_when_ready_train=prefer_swap_when_ready_train,
-            )
-            if len(selected_valid_indices) == 0:
-                action_idx = no_op_idx if no_op_idx is not None else random.randrange(num_actions)
-            elif random.random() < epsilon:
-                action_idx = random.choice(selected_valid_indices)
+            if swap_guidance == "ready_node":
+                # SOFT, TRAINING-ONLY swap-guided EXPLORATION (the coverage fix). It changes only
+                # which transitions we SAMPLE -- exploitation (the greedy argmax) and the TD target
+                # below stay UNFILTERED over all valid actions, so the learned Q ranking and the
+                # eval policy are untouched. In the explore branch, ready-node swaps (same rule as
+                # eval) are oversampled with prob swap_guidance_prob so their Q* finally gets
+                # learned, while non-swap valid actions keep nonzero sampling probability so their
+                # Q stays calibrated for the honest unfiltered-greedy comparison.
+                if len(valid_indices) == 0:
+                    action_idx = no_op_idx if no_op_idx is not None else random.randrange(num_actions)
+                elif random.random() < epsilon:
+                    ready_swaps = ready_node_swap_action_indices(current_state[0], all_actions, valid_indices)
+                    if ready_swaps and random.random() < swap_guidance_prob:
+                        action_idx = random.choice(ready_swaps)
+                    else:
+                        action_idx = random.choice(valid_indices)
+                else:
+                    with torch.no_grad():
+                        q_values = policy_net(obs.unsqueeze(0)).squeeze(0)
+                        valid_mask = torch.zeros(num_actions, dtype=torch.bool, device=q_values.device)
+                        valid_mask[valid_indices] = True
+                        q_values[~valid_mask] = -1e9
+                        action_idx = int(torch.argmax(q_values).item())
             else:
-                with torch.no_grad():
-                    q_values = policy_net(obs.unsqueeze(0)).squeeze(0)
-                    valid_mask = torch.zeros(num_actions, dtype=torch.bool, device=q_values.device)
-                    valid_mask[selected_valid_indices] = True
-                    q_values[~valid_mask] = -1e9
-                    action_idx = int(torch.argmax(q_values).item())
+                # Legacy path (swap_guidance="off"): byte-for-byte the prior behavior, including the
+                # optional prefer_swap_when_ready_train hard filter applied to explore AND exploit.
+                selected_valid_indices = _filter_training_action_indices(
+                    current_state[0],
+                    all_actions,
+                    valid_indices,
+                    prefer_swap_when_ready_train=prefer_swap_when_ready_train,
+                )
+                if len(selected_valid_indices) == 0:
+                    action_idx = no_op_idx if no_op_idx is not None else random.randrange(num_actions)
+                elif random.random() < epsilon:
+                    action_idx = random.choice(selected_valid_indices)
+                else:
+                    with torch.no_grad():
+                        q_values = policy_net(obs.unsqueeze(0)).squeeze(0)
+                        valid_mask = torch.zeros(num_actions, dtype=torch.bool, device=q_values.device)
+                        valid_mask[selected_valid_indices] = True
+                        q_values[~valid_mask] = -1e9
+                        action_idx = int(torch.argmax(q_values).item())
 
             new_state = this_RepeaterChain.step(current_state, all_actions[action_idx])
             step += 1
@@ -792,6 +818,10 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                 phi_s_next = chain_progress_potential_batch(new_state.unsqueeze(0))[0].item()
                 shaping = hyperparameter_configs.gamma * phi_s_next - phi_s
                 r_train = reward + pbrs_scale * shaping
+            if step_penalty > 0.0:
+                # OFF-by-default fallback toggle: constant per-step penalty on the TRAINING reward
+                # only (episode-return logging stays unshaped). Not part of the n=7 pilot recipe.
+                r_train = r_train - step_penalty
 
             next_obs = preprocess_obs(new_state, obs_mode, hyperparameter_configs.counter_norm).to(torch_device)
             replay_buffer.add(
@@ -823,6 +853,20 @@ def train_dqn_agent(env_vars, hyperparameter_configs, **kwargs):
                     # Channel 0 remains the adjacency matrix for both DQN observation modes.
                     next_state0_batch = next_obs_batch[:, 0]
                     next_valid_mask = _build_valid_action_mask(next_state0_batch, all_actions, no_op_idx)
+                    if target_swap_mask:
+                        # OFF-by-default ablation (fallback ladder item 2): restrict the bootstrap
+                        # action set to ready-node swaps where available, else all valid actions.
+                        # Per-sample, so a batch loop -- only paid when explicitly enabled. The n=7
+                        # pilot keeps this OFF (we are learning Q* for unfiltered-greedy eval).
+                        masked = next_valid_mask.clone()
+                        for b in range(next_state0_batch.size(0)):
+                            nb_valid = next_valid_mask[b].nonzero(as_tuple=True)[0].tolist()
+                            rs = ready_node_swap_action_indices(next_state0_batch[b], all_actions, nb_valid)
+                            if rs:
+                                row = torch.zeros_like(next_valid_mask[b])
+                                row[rs] = True
+                                masked[b] = row
+                        next_valid_mask = masked
                     next_q_target_values = target_net(next_obs_batch)
                     if double_dqn:
                         # Double-DQN: policy net selects the (valid) argmax action,
@@ -1088,6 +1132,12 @@ if __name__ == "__main__":
     parser.add_argument("--best_eval_max_actions", type=int, default=100)
     parser.add_argument("--best_eval_seed", type=int, default=None)
     parser.add_argument("--prefer_swap_when_ready_train", action="store_true")
+    # Training-only swap-guided exploration (coverage fix; eval + TD target stay unfiltered).
+    parser.add_argument("--swap_guidance", choices=["off", "ready_node"], default="off")
+    parser.add_argument("--swap_guidance_prob", type=float, default=0.5)
+    # OFF-by-default fallback toggles (ablation only; not part of the n=7 pilot recipe).
+    parser.add_argument("--target_swap_mask", action="store_true", default=False)
+    parser.add_argument("--step_penalty", type=float, default=0.0)
     parser.add_argument("--double-dqn", dest="double_dqn", action="store_true", default=False)
     parser.add_argument("--dueling", action="store_true", default=False)
     parser.add_argument("--pbrs", action="store_true", default=False)
@@ -1121,6 +1171,9 @@ if __name__ == "__main__":
     print(f"Reward mode: {env_vars_class.reward_mode}")
     print(f"eps_decay_steps: {this_dqn_hyperparameters.eps_decay_steps}")
     print(f"Prefer swap when ready during training: {env_vars_class.prefer_swap_when_ready_train}")
+    print(f"Swap guidance (training-only exploration): {env_vars_class.swap_guidance} "
+          f"prob={env_vars_class.swap_guidance_prob} | target_swap_mask={env_vars_class.target_swap_mask} "
+          f"step_penalty={env_vars_class.step_penalty}")
     if agent_mode in DQN_OBS_MODES:
         train_episodes = env_vars_class.train_episodes or training_episodes
         run_artifacts = _build_dqn_paths(env_vars, env_vars["model_tag"])
@@ -1166,6 +1219,10 @@ if __name__ == "__main__":
                 "best_eval_max_actions": env_vars_class.best_eval_max_actions,
                 "best_eval_seed": env_vars_class.best_eval_seed,
                 "prefer_swap_when_ready_train": env_vars_class.prefer_swap_when_ready_train,
+                "swap_guidance": env_vars_class.swap_guidance,
+                "swap_guidance_prob": env_vars_class.swap_guidance_prob,
+                "target_swap_mask": env_vars_class.target_swap_mask,
+                "step_penalty": env_vars_class.step_penalty,
                 "net_arch": net_arch,
                 "double_dqn": env_vars_class.double_dqn,
                 "pbrs": env_vars_class.pbrs,
@@ -1213,6 +1270,16 @@ if __name__ == "__main__":
         start_time = time.time()
         curriculum_steps = [int(x) for x in env_vars_class.curriculum_steps.split(",")]
         curriculum_boundaries = [int(x) for x in env_vars_class.curriculum_boundaries.split(",")]
+        if env_vars_class.use_curriculum:
+            # Guard the N-stage invariant so a mis-sized config fails loudly instead of
+            # silently capping at the last reachable stage (the n=7 4-stage failure mode).
+            if len(curriculum_steps) != len(curriculum_boundaries) + 1:
+                raise SystemExit(
+                    f"--curriculum_steps has {len(curriculum_steps)} entries but must have exactly "
+                    f"one more than --curriculum_boundaries ({len(curriculum_boundaries)})."
+                )
+            if any(b0 >= b1 for b0, b1 in zip(curriculum_boundaries, curriculum_boundaries[1:])):
+                raise SystemExit("--curriculum_boundaries must be strictly increasing.")
 
         (
             model,
@@ -1246,6 +1313,10 @@ if __name__ == "__main__":
             best_eval_metrics_path=run_artifacts["best_eval_metrics_path"],
             best_eval_checkpoint_path=run_artifacts["best_eval_checkpoint_path"],
             prefer_swap_when_ready_train=env_vars_class.prefer_swap_when_ready_train,
+            swap_guidance=env_vars_class.swap_guidance,
+            swap_guidance_prob=env_vars_class.swap_guidance_prob,
+            target_swap_mask=env_vars_class.target_swap_mask,
+            step_penalty=env_vars_class.step_penalty,
             dueling=env_vars_class.dueling,
             double_dqn=env_vars_class.double_dqn,
             pbrs=env_vars_class.pbrs,

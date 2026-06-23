@@ -174,6 +174,36 @@ def test_chain_progress_potential():
     expected_tensor = torch.tensor(expected, dtype=torch.long)
     assert torch.equal(actual, expected_tensor), (actual, expected_tensor)
 
+def ready_interior_nodes(state0):
+    """Interior nodes (1..n-2) currently at degree 2 -- 'ready' to be swapped out.
+
+    THE single shared readiness rule. The eval-time swap-prefer/heuristic policies (via
+    head_to_head) and the training-time swap-guided exploration both import this, so behavior
+    and evaluation use one definition of 'ready'.
+    """
+    if state0.size(0) <= 2:
+        return []
+    degrees = torch.count_nonzero(state0, dim=1)
+    return [int(idx.item()) + 1 for idx in (degrees[1:-1] == 2).nonzero(as_tuple=False).flatten()]
+
+
+def action_swaps_ready_node(action_matrix, ready_nodes):
+    """True iff the action's diagonal performs a swap at one of the given ready nodes."""
+    diag = torch.diagonal(action_matrix, 0)
+    return any(bool(diag[node].item() > 0) for node in ready_nodes)
+
+
+def ready_node_swap_action_indices(state0, all_actions, valid_indices):
+    """Subset of valid_indices whose action swaps a currently-ready interior node.
+
+    Shared by training-time swap-guided exploration and eval; returns [] when no node is ready.
+    """
+    ready = ready_interior_nodes(state0)
+    if not ready:
+        return []
+    return [idx for idx in valid_indices if action_swaps_ready_node(all_actions[idx], ready)]
+
+
 def count_swap_ready_nodes(state0, action_matrix):
     n = state0.size(0)
     degrees = torch.count_nonzero(state0, dim=1)
